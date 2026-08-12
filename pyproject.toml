@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asset-hub"
+version = "0.1.0"
+description = "ybyc 本地素材中台：catalog / sync 预热 / 极速打包下载"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "httpx>=0.27.0",
+  "openpyxl>=3.1.5",
+  "xlrd>=2.0.1",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.6.0",
+  "pyyaml>=6.0.2",
+  "python-multipart>=0.0.12",
+]
+
+[project.scripts]
+asset-hub-api = "asset_hub.api.main:run"
+asset-hub-worker = "asset_hub.worker.main:run"
+asset-hub-sync = "asset_hub.sync.main:run"
+asset-hub-index = "asset_hub.catalog.index:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]

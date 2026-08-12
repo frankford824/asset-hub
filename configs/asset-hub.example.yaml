@@ -1,0 +1,21 @@
+# /etc/asset-hub/config.yaml 默认形态（install.sh 会拷贝并可用环境变量覆盖路径）
+library_root: /home/resourse
+data_root: /var/lib/asset-hub
+local_only: true
+workers: 3
+provider: mock          # mock | http
+http:
+  base_url: ""          # 后续填真实清单/下载接口（不在本仓实现）
+  token: ""
+  timeout_sec: 30
+sync:
+  # finalized=生产终稿热缓存；archive=P4 冷库（默认不启用，需要时加入 kinds）
+  kinds: [finalized]
+  interval_sec: 300
+  ignore_globs:
+    - "Thumbs.db"
+    - "desktop.ini"
+    - "._*"
+api:
+  host: 127.0.0.1
+  port: 8080

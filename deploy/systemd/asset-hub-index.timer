@@ -1,0 +1,12 @@
+[Unit]
+Description=asset-hub catalog index timer
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+Unit=asset-hub-index.service
+
+[Install]
+WantedBy=timers.target
