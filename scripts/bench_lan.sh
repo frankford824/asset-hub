@@ -26,7 +26,7 @@ import json, statistics, time, urllib.parse, urllib.request
 base = ${BASE_URL@Q}
 sku = ${SKU@Q}
 n = int(${SEARCH_N@Q})
-url = f"{base}/api/v1/search?" + urllib.parse.urlencode({"q": sku, "kind": "finalized", "limit": 20})
+url = f"{base}/api/v1/search?" + urllib.parse.urlencode({"q": sku, "limit": 20})
 samples = []
 for i in range(n):
     t0 = time.perf_counter()
@@ -46,7 +46,7 @@ ASSET_ID="$(python3 - <<PY
 import json, urllib.parse, urllib.request
 base = ${BASE_URL@Q}
 sku = ${SKU@Q}
-url = f"{base}/api/v1/search?" + urllib.parse.urlencode({"q": sku, "kind": "finalized", "limit": 1})
+url = f"{base}/api/v1/search?" + urllib.parse.urlencode({"q": sku, "limit": 1})
 with urllib.request.urlopen(url, timeout=30) as r:
     data = json.load(r)
 rows = data.get("results") or []

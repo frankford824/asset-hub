@@ -174,7 +174,10 @@ function showPackDone(job) {
     svg.replaceWith(clone);
   }
   $("#pack-overlay-title").textContent = "打包完成";
-  $("#pack-overlay-sub").textContent = job.filename || "可以下载结果包";
+  $("#pack-overlay-sub").textContent = humanLabel(
+    job.progress && job.progress.label,
+    job.status
+  );
   $("#overlay-fill").style.width = "100%";
   $("#pack-overlay-actions").hidden = false;
   if (job.has_download) {
@@ -320,12 +323,11 @@ function renderJobs(jobs) {
 
 async function refreshStatus() {
   const s = await api("/api/v1/status");
-  const total =
-    (s.finalized_count || 0) + (s.library_count || 0) + (s.archive_count || 0);
+  const total = s.asset_count || 0;
   $("#meta-count").textContent = `素材 ${total.toLocaleString()}`;
   const ready = s.ready_for_pack || total > 0;
   const chip = $("#meta-ready");
-  chip.textContent = ready ? "可用" : "准备中";
+  chip.textContent = ready ? (s.sync_complete ? "已就绪" : "同步中，可用") : "准备中";
   chip.className = `meta-chip ${ready ? "ok" : "warn"}`;
 }
 

@@ -620,9 +620,19 @@ class Catalog:
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
         q = query.strip()
+        priority_order = """
+          CASE kind
+            WHEN 'finalized' THEN 0
+            WHEN 'library' THEN 1
+            WHEN 'archive' THEN 2
+            ELSE 3
+          END,
+          updated_at DESC,
+          asset_id ASC
+        """
         with self.connect() as conn:
             if not q:
-                where = "deleted=0"
+                where = "deleted=0 AND status='ready'"
                 args: list = []
                 if kind:
                     where += " AND kind=?"
@@ -633,7 +643,7 @@ class Catalog:
                     ]
                 )
                 rows = conn.execute(
-                    f"SELECT * FROM assets WHERE {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    f"SELECT * FROM assets WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
@@ -643,7 +653,7 @@ class Catalog:
             base = """
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
-              WHERE t.token=? AND a.deleted=0
+              WHERE t.token=? AND a.deleted=0 AND a.status='ready'
             """
             args = [token]
             if kind:
@@ -652,7 +662,14 @@ class Catalog:
             total = int(conn.execute(f"SELECT COUNT(*) AS c {base}", args).fetchone()["c"])
             if total:
                 rows = conn.execute(
-                    f"SELECT a.* {base} ORDER BY a.updated_at DESC LIMIT ? OFFSET ?",
+                    f"""SELECT a.* {base}
+                    ORDER BY CASE a.kind
+                      WHEN 'finalized' THEN 0
+                      WHEN 'library' THEN 1
+                      WHEN 'archive' THEN 2
+                      ELSE 3 END,
+                      a.updated_at DESC, a.asset_id ASC
+                    LIMIT ? OFFSET ?""",
                     [*args, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
@@ -666,7 +683,7 @@ class Catalog:
                 base = """
                   FROM assets a
                   JOIN assets_fts f ON f.asset_id=a.asset_id
-                  WHERE f MATCH ? AND a.deleted=0
+                  WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
                 """
                 args2: list = [fts_term]
                 if kind:
@@ -676,14 +693,21 @@ class Catalog:
                     conn.execute(f"SELECT COUNT(*) AS c {base}", args2).fetchone()["c"]
                 )
                 rows = conn.execute(
-                    f"SELECT a.* {base} LIMIT ? OFFSET ?",
+                    f"""SELECT a.* {base}
+                    ORDER BY CASE a.kind
+                      WHEN 'finalized' THEN 0
+                      WHEN 'library' THEN 1
+                      WHEN 'archive' THEN 2
+                      ELSE 3 END,
+                      a.updated_at DESC, a.asset_id ASC
+                    LIMIT ? OFFSET ?""",
                     [*args2, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
             except sqlite3.OperationalError:
                 like = f"%{q}%"
                 where = """
-                  deleted=0 AND (
+                  deleted=0 AND status='ready' AND (
                     file_name LIKE ? OR original_filename LIKE ?
                     OR sku_code LIKE ? OR storage_key LIKE ?
                   )
@@ -698,7 +722,7 @@ class Catalog:
                     ).fetchone()["c"]
                 )
                 rows = conn.execute(
-                    f"SELECT * FROM assets WHERE {where} LIMIT ? OFFSET ?",
+                    f"SELECT * FROM assets WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args3, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
@@ -710,6 +734,43 @@ class Catalog:
                 (kind,),
             ).fetchone()
             return int(row["c"]) if row else 0
+
+    def count_ready_all(self) -> int:
+        """Count every locally usable asset in the unified catalog."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM assets WHERE deleted=0 AND status='ready'"
+            ).fetchone()
+            return int(row["c"]) if row else 0
+
+    def order_current_assets(self, assets: Sequence[AssetRow]) -> list[AssetRow]:
+        """Order current-version candidates by finalized metadata and remove duplicates."""
+        by_id = {asset.asset_id: asset for asset in assets}
+        if not by_id:
+            return []
+        placeholders = ",".join("?" for _ in by_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.asset_id
+                FROM assets a
+                LEFT JOIN (
+                  SELECT task_asset_id,
+                         MAX(finalized_at) AS finalized_at,
+                         MIN(sort_order) AS sort_order
+                  FROM finalized_items
+                  WHERE deleted=0
+                  GROUP BY task_asset_id
+                ) i ON i.task_asset_id=a.task_asset_id
+                WHERE a.asset_id IN ({placeholders})
+                ORDER BY COALESCE(i.finalized_at, 0) DESC,
+                         COALESCE(i.sort_order, 2147483647) ASC,
+                         a.updated_at DESC,
+                         a.asset_id ASC
+                """,
+                list(by_id),
+            ).fetchall()
+        return [by_id[row["asset_id"]] for row in rows]
 
     def set_sync_state(
         self,

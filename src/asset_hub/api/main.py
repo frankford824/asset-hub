@@ -78,6 +78,7 @@ def health() -> dict:
         "local_only": s.local_only,
         "provider": s.provider,
         "data_root": str(s.data_root),
+        "asset_count": cat.count_ready_all(),
         "finalized_ready": cat.is_finalized_ready(),
         "finalized_count": cat.count_ready("finalized"),
     }
@@ -88,8 +89,11 @@ def status() -> dict:
     s = get_settings()
     cat = Catalog(s)
     sync = cat.get_sync_state("finalized")
+    asset_count = cat.count_ready_all()
     return {
-        "ready_for_pack": bool(sync.get("ready")),
+        "ready_for_pack": asset_count > 0,
+        "sync_complete": bool(sync.get("ready")),
+        "asset_count": asset_count,
         "local_only": s.local_only,
         "provider": s.provider,
         "workers": s.workers,
@@ -111,12 +115,11 @@ def status() -> dict:
 @app.get("/api/v1/search")
 def search(
     q: str = "",
-    kind: str | None = Query(default=None),
     limit: int = 24,
     offset: int = 0,
 ) -> dict:
     cat = Catalog()
-    rows, total = cat.search(q, kind=kind, limit=limit, offset=offset)
+    rows, total = cat.search(q, limit=limit, offset=offset)
     return {
         "query": q,
         "total": total,
@@ -126,13 +129,10 @@ def search(
         "results": [
             {
                 "asset_id": r.asset_id,
-                "kind": r.kind,
                 "file_name": r.file_name,
                 "file_size": r.file_size,
                 "sku_code": r.sku_code,
                 "sku_name": r.sku_name,
-                "status": r.status,
-                "local_path": r.local_path,
                 "previewable": _is_previewable(r.file_name),
             }
             for r in rows
@@ -215,6 +215,7 @@ def list_jobs(limit: int = 20) -> dict:
                 "status": j.status,
                 "filename": j.filename,
                 "created_at": j.created_at,
+                "started_at": j.started_at,
                 "finished_at": j.finished_at,
                 "progress": j.progress,
                 "error": j.error,
@@ -232,8 +233,8 @@ async def create_job(
 ) -> dict:
     s = get_settings()
     cat = Catalog(s)
-    if s.local_only and not cat.is_finalized_ready() and cat.count_ready("finalized") == 0:
-        raise HTTPException(409, "终稿缓存未就绪（local_only），请先跑 sync")
+    if s.local_only and cat.count_ready_all() == 0:
+        raise HTTPException(409, "统一素材库暂无可用文件，请先完成同步或本地目录索引")
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".xlsx", ".xls"}:
         raise HTTPException(400, "仅支持 .xlsx / .xls")

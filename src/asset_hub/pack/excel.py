@@ -80,16 +80,45 @@ def read_excel_rows(path: Path) -> list[ExcelRow]:
 
 
 def match_assets_for_rows(catalog: Catalog, rows: list[ExcelRow], limit_per_row: int = 20):
-    """Align to production idea: prefer SKU token exact hits in finalized catalog."""
+    """Match one logical library, preferring current-version assets with local fallback."""
     matched = []
     missing = []
     for row in rows:
         q = row.sku_code or row.sku_name
-        hits, _total = catalog.search(q, kind="finalized", limit=limit_per_row) if q else ([], 0)
-        # filter ready with local file
-        ready = [h for h in hits if h.status == "ready" and h.local_path]
-        if ready:
-            matched.append({"row": row, "assets": ready})
+        hits, _total = catalog.search(q, limit=limit_per_row) if q else ([], 0)
+        available = [
+            hit
+            for hit in hits
+            if hit.local_path and Path(hit.local_path).is_file()
+        ]
+        if not available and row.sku_name and row.sku_name != q:
+            hits, _total = catalog.search(row.sku_name, limit=limit_per_row)
+            available = [
+                hit
+                for hit in hits
+                if hit.local_path and Path(hit.local_path).is_file()
+            ]
+
+        current = [hit for hit in available if hit.kind == "finalized"]
+        fallback = [hit for hit in available if hit.kind != "finalized"]
+        if current:
+            matched.append(
+                {
+                    "row": row,
+                    "assets": catalog.order_current_assets(current),
+                    "selection_policy": "preferred_current",
+                    "selection_label": "当前优选",
+                }
+            )
+        elif fallback:
+            matched.append(
+                {
+                    "row": row,
+                    "assets": fallback,
+                    "selection_policy": "library_fallback",
+                    "selection_label": "库内兜底",
+                }
+            )
         else:
             missing.append({"row": row, "query": q})
     return matched, missing

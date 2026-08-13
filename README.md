@@ -23,7 +23,7 @@ asset-hub/
 | 代码发布 | `/opt/asset-hub` | `ASSET_HUB_ROOT` |
 | 数据（NVMe） | `/var/lib/asset-hub` | `ASSET_HUB_DATA` |
 | 配置 | `/etc/asset-hub/config.yaml` | `ASSET_HUB_CONFIG` |
-| 徐凯素材库 | `/home/resourse` | `ASSET_HUB_LIBRARY` |
+| 既有本地素材目录 | `/home/resourse` | `ASSET_HUB_LIBRARY` |
 
 ## 安装（在 ybyc）
 
@@ -77,12 +77,22 @@ atomic rename。`missing`、`size_mismatch`、`not_current` 或 `error` 均不�
 Manifest 返回 304，也会按 `verify_interval_sec` 定期为全部当前对象重新申请
 ticket，以发现同 key 覆盖或 OSS 删除。
 
-## 数据分层
+## 统一素材库
+
+对检索和订单打包来说，系统只有一个素材库。`finalized`、`library`、`archive`
+只是内部存储与同步策略，不是面向用户的库。检索只返回本地可用素材，不暴露
+内部来源和物理路径；订单打包按“当前版本优先、其他本地可用素材兜底”自动选择，
+结果包内附带 `素材选择说明.txt`。
+
+内部物理路径保持分开，避免首次同步时搬迁或重复复制大量数据；SQLite catalog
+提供统一逻辑视图，因此不要求文件必须位于同一目录。
+
+### 内部存储
 
 | kind | 路径 | 用途 |
 |---|---|---|
-| `finalized` | `$DATA/finalized` | 生产终稿热缓存（打包默认） |
-| `library` | `/home/resourse` | 徐凯冷库，检索/旁路下载 |
+| `finalized` | `$DATA/finalized` | 线上当前版本缓存（自动优先） |
+| `library` | `/home/resourse` | 既有本地素材（自动兜底） |
 | `archive` | `$DATA/archive` | P4 历史冷库预留目录；当前 manifest/ticket provider 尚未支持 |
 
 ## 本地测试
