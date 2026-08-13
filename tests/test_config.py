@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from asset_hub.config import Settings, load_settings
 
 
@@ -20,3 +23,8 @@ def test_settings_env_override(tmp_path, monkeypatch):
     monkeypatch.setenv("ASSET_HUB_DATA", str(tmp_path / "nvme"))
     s = load_settings(cfg)
     assert s.data_root == tmp_path / "nvme"
+
+
+def test_ticket_batch_cannot_exceed_upstream_contract():
+    with pytest.raises(ValidationError):
+        Settings.model_validate({"sync": {"ticket_batch_size": 51}})

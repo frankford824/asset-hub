@@ -5,13 +5,16 @@ local_only: true
 workers: 3
 provider: mock          # mock | http
 http:
-  base_url: ""          # 后续填真实清单/下载接口（不在本仓实现）
-  token: ""
+  base_url: ""          # yongboWorkflow 服务根地址，例如 https://api.example.com
+  token: ""             # ASSET_SYNC_API_TOKEN 对应的机器密钥
   timeout_sec: 30
 sync:
-  # finalized=生产终稿热缓存；archive=P4 冷库（默认不启用，需要时加入 kinds）
+  # 当前线上 manifest/ticket 契约只支持 finalized；archive 仍是预留能力。
   kinds: [finalized]
   interval_sec: 300
+  ticket_batch_size: 50
+  # 即使 Manifest 未变化，也每天重新申请 ticket/Stat 一次，发现同 key 覆盖或 OSS 删除。
+  verify_interval_sec: 86400
   ignore_globs:
     - "Thumbs.db"
     - "desktop.ini"

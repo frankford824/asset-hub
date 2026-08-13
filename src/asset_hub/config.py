@@ -18,6 +18,8 @@ class HttpConfig(BaseModel):
 class SyncConfig(BaseModel):
     kinds: list[str] = Field(default_factory=lambda: ["finalized"])
     interval_sec: int = 300
+    ticket_batch_size: int = Field(default=50, ge=1, le=50)
+    verify_interval_sec: int = Field(default=86400, ge=60)
     ignore_globs: list[str] = Field(
         default_factory=lambda: ["Thumbs.db", "desktop.ini", "._*"]
     )

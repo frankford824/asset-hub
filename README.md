@@ -39,15 +39,43 @@ sudo ./deploy/install.sh
 首次建议：
 
 ```bash
-sudo systemctl start asset-hub-sync.service   # mock 预热 finalized
+sudo systemctl start asset-hub-sync.service   # 预热 finalized（首次可用 mock 验证）
 sudo systemctl start asset-hub-index.service  # 索引 /home/resourse
 curl -s http://127.0.0.1/health
 ./scripts/bench_lan.sh
 ```
 
-## Provider
+## Provider 与线上契约
 
-配置 `provider: mock`（默认）或后续 `http`。线上 OSS/清单 API **不在本仓实现**；你提供接口后只改 `http.base_url` / `token`。
+配置 `provider: mock`（默认）可在纯本地验证链路；接入线上时改为：
+
+```yaml
+provider: http
+http:
+  base_url: https://<yongboWorkflow-host>
+  token: <ASSET_SYNC_API_TOKEN>
+  timeout_sec: 30
+sync:
+  kinds: [finalized]
+  ticket_batch_size: 50
+  verify_interval_sec: 86400
+```
+
+HTTP provider 只消费 `yongboWorkflow` 的 finalized 权威契约：
+
+- `GET /v1/integration/asset-sync/finalized/manifest`
+- `POST /v1/integration/asset-sync/finalized/download-tickets`
+- 鉴权头：`X-Asset-Sync-Token`
+- Manifest 使用弱 ETag；客户端保存 ETag，并在后续请求发送 `If-None-Match`。
+- Ticket 每批最多 50 个 `task_asset_id`，只有 `ready` 才会下载。
+
+旧的 `/sync/list?cursor=` 和 `/sync/download?storage_key=` 不再受支持。完整
+Manifest 会原子更新 catalog；退出当前 finalized 的对象/item 只标记 tombstone，
+不会自动删除本地文件。下载使用 `.part` 临时文件，完成大小与可用校验后再
+atomic rename。`missing`、`size_mismatch`、`not_current` 或 `error` 均不会让
+整体同步误报 ready；`retryable=true` 的错误会在下一轮自动重试。即使
+Manifest 返回 304，也会按 `verify_interval_sec` 定期为全部当前对象重新申请
+ticket，以发现同 key 覆盖或 OSS 删除。
 
 ## 数据分层
 
@@ -55,7 +83,7 @@ curl -s http://127.0.0.1/health
 |---|---|---|
 | `finalized` | `$DATA/finalized` | 生产终稿热缓存（打包默认） |
 | `library` | `/home/resourse` | 徐凯冷库，检索/旁路下载 |
-| `archive` | `$DATA/archive` | P4 历史冷库（`sync.kinds` 加入 `archive` 才启用） |
+| `archive` | `$DATA/archive` | P4 历史冷库预留目录；当前 manifest/ticket provider 尚未支持 |
 
 ## 本地测试
 
@@ -64,3 +92,6 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e . pytest
 ASSET_HUB_CONFIG=/dev/null pytest -q
 ```
+
+测试包含真实本地 HTTP stub：覆盖机器 token、弱 ETag/304、manifest/ticket
+envelope、签名 URL 下载、元数据持久化、retryable 重试和快照退出 tombstone。
