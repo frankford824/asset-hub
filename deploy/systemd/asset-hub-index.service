@@ -10,7 +10,10 @@ Group=asset-hub
 Environment=ASSET_HUB_CONFIG=/etc/asset-hub/config.yaml
 Environment=ASSET_HUB_ROOT=/opt/asset-hub
 WorkingDirectory=/opt/asset-hub
-ExecStart=/opt/asset-hub/.venv/bin/asset-hub-index
+RuntimeDirectory=asset-hub
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/flock --exclusive --wait 7200 /run/asset-hub/catalog.lock /opt/asset-hub/.venv/bin/asset-hub-index
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7

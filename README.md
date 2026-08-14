@@ -87,6 +87,10 @@ ticket，以发现同 key 覆盖或 OSS 删除。
 内部物理路径保持分开，避免首次同步时搬迁或重复复制大量数据；SQLite catalog
 提供统一逻辑视图，因此不要求文件必须位于同一目录。
 
+`asset-hub-index` 使用批量事务重建既有目录索引；index 与 finalized sync 通过
+`/run/asset-hub/catalog.lock` 串行写 catalog。index timer 从一次索引完成后再计时
+30 分钟，避免索引耗时超过周期时立即补跑并长期占用 SQLite 写锁。
+
 ### 内部存储
 
 | kind | 路径 | 用途 |

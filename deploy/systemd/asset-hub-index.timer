@@ -3,7 +3,7 @@ Description=asset-hub catalog index timer
 
 [Timer]
 OnBootSec=3min
-OnUnitActiveSec=30min
+OnUnitInactiveSec=30min
 AccuracySec=1min
 Persistent=true
 Unit=asset-hub-index.service

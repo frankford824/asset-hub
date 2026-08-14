@@ -389,6 +389,8 @@ def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Signed OSS ticket URLs must never be emitted by httpx request logging.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     stats = sync_once()
     if not stats["ready_for_pack"]:
         raise SystemExit(1)

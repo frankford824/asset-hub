@@ -74,6 +74,23 @@ def test_catalog_search_sku(settings):
     assert hits[0][0].asset_id == "a1"
 
 
+def test_catalog_bulk_upsert(settings):
+    cat = Catalog(settings)
+    rows = [
+        AssetRow(
+            asset_id=f"bulk:{index}",
+            kind="library",
+            file_name=f"HQT-BULK-{index}.jpg",
+            sku_code=f"HQT-BULK-{index}",
+            status="ready",
+        )
+        for index in range(3)
+    ]
+
+    assert cat.upsert_assets(rows) == 3
+    assert cat.count_ready("library") == 3
+
+
 def test_unified_search_ready_only_and_current_first(settings, tmp_path):
     cat = Catalog(settings)
     library_file = tmp_path / "library-HQT20001.jpg"

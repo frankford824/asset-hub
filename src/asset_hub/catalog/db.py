@@ -217,6 +217,16 @@ class Catalog:
         with self.connect() as conn:
             self._upsert_asset(conn, asset, now)
 
+    def upsert_assets(self, assets: Sequence[AssetRow]) -> int:
+        """Upsert a bounded batch in one transaction to avoid per-file commits."""
+        rows = list(assets)
+        if not rows:
+            return 0
+        with self.connect() as conn:
+            for asset in rows:
+                self._upsert_asset(conn, asset, asset.updated_at or time.time())
+        return len(rows)
+
     @staticmethod
     def _upsert_asset(
         conn: sqlite3.Connection, asset: AssetRow, updated_at: float | None = None

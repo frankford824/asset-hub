@@ -10,13 +10,20 @@ from asset_hub.catalog.ignore import should_ignore
 from asset_hub.config import ensure_data_dirs, get_settings
 
 log = logging.getLogger("asset_hub.index")
+BATCH_SIZE = 500
 
 
-def index_library(catalog: Catalog, root: Path, ignore_globs: list[str], limit: int | None = None) -> int:
+def index_library(
+    catalog: Catalog,
+    root: Path,
+    ignore_globs: list[str],
+    limit: int | None = None,
+) -> int:
     if not root.is_dir():
         log.warning("library root missing: %s", root)
         return 0
     count = 0
+    batch: list[AssetRow] = []
     for dirpath, dirnames, filenames in os.walk(root):
         # prune ignored dirs
         dirnames[:] = [d for d in dirnames if not should_ignore(d, ignore_globs)]
@@ -30,7 +37,7 @@ def index_library(catalog: Catalog, root: Path, ignore_globs: list[str], limit: 
                 continue
             rel = path.relative_to(root).as_posix()
             asset_id = f"lib:{rel}"
-            catalog.upsert_asset(
+            batch.append(
                 AssetRow(
                     asset_id=asset_id,
                     kind="library",
@@ -46,10 +53,15 @@ def index_library(catalog: Catalog, root: Path, ignore_globs: list[str], limit: 
                 )
             )
             count += 1
+            if len(batch) >= BATCH_SIZE:
+                catalog.upsert_assets(batch)
+                batch.clear()
             if limit and count >= limit:
+                catalog.upsert_assets(batch)
                 return count
         if count and count % 5000 == 0:
             log.info("indexed library files=%s", count)
+    catalog.upsert_assets(batch)
     return count
 
 
