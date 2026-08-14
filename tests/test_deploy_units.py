@@ -20,3 +20,10 @@ def test_index_timer_waits_from_completion():
 
     assert "OnUnitInactiveSec=30min" in timer
     assert "OnUnitActiveSec" not in timer
+
+
+def test_sync_timer_waits_from_completion():
+    timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
+
+    assert "OnUnitInactiveSec=5min" in timer
+    assert "OnUnitActiveSec" not in timer

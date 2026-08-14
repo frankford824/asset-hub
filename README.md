@@ -89,7 +89,8 @@ ticket，以发现同 key 覆盖或 OSS 删除。
 
 `asset-hub-index` 使用批量事务重建既有目录索引；index 与 finalized sync 通过
 `/run/asset-hub/catalog.lock` 串行写 catalog。index timer 从一次索引完成后再计时
-30 分钟，避免索引耗时超过周期时立即补跑并长期占用 SQLite 写锁。
+30 分钟，sync timer 从一次同步完成后再计时 5 分钟，避免任务耗时超过周期时
+立即补跑并长期占用 SQLite 写锁或 CPU。
 
 ### 内部存储
 

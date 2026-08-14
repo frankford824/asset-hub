@@ -3,7 +3,7 @@ Description=asset-hub sync preheat timer (default 5min)
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=5min
+OnUnitInactiveSec=5min
 AccuracySec=30s
 Persistent=true
 Unit=asset-hub-sync.service
