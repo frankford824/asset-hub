@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -30,6 +32,55 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="asset-hub", version=__version__, lifespan=lifespan)
+
+_status_cache_lock = threading.Lock()
+_status_cache_at = 0.0
+_status_cache: dict = {}
+_jobs_cache_lock = threading.Lock()
+_jobs_cache_at = 0.0
+_jobs_cache: dict = {"jobs": []}
+_download_cache_lock = threading.Lock()
+_download_cache: dict[str, tuple[str, str]] = {}
+
+
+def _status_snapshot(max_age: float = 1.0) -> dict:
+    global _status_cache_at, _status_cache
+    now = time.monotonic()
+    if now - _status_cache_at <= max_age and _status_cache:
+        return _status_cache
+    with _status_cache_lock:
+        now = time.monotonic()
+        if now - _status_cache_at <= max_age and _status_cache:
+            return _status_cache
+        s = get_settings()
+        cat = Catalog(s)
+        sync = cat.get_sync_state("finalized")
+        asset_count = cat.count_ready_all()
+        _status_cache = {
+            "ready_for_pack": asset_count > 0,
+            "sync_complete": bool(sync.get("ready")),
+            "asset_count": asset_count,
+            "local_only": s.local_only,
+            "provider": s.provider,
+            "workers": s.workers,
+            "pack_workers": s.pack_workers,
+            "api_workers": s.api.workers,
+            "finalized_count": cat.count_ready("finalized"),
+            "finalized_ready": cat.is_finalized_ready(),
+            "archive_count": cat.count_ready("archive"),
+            "library_count": cat.count_ready("library"),
+            "sync": sync,
+            "paths": {
+                "data_root": str(s.data_root),
+                "finalized": str(s.finalized_dir),
+                "archive": str(s.archive_dir),
+                "jobs": str(s.jobs_dir),
+                "library": str(s.library_root),
+                "db": str(s.db_path),
+            },
+        }
+        _status_cache_at = now
+        return _status_cache
 
 
 def _x_accel(
@@ -140,46 +191,22 @@ def _download_archive(asset_ids: list[str], background_tasks: BackgroundTasks) -
 
 @app.get("/health")
 def health() -> dict:
-    s = get_settings()
-    cat = Catalog(s)
+    snapshot = _status_snapshot()
     return {
         "ok": True,
         "version": __version__,
-        "local_only": s.local_only,
-        "provider": s.provider,
-        "data_root": str(s.data_root),
-        "asset_count": cat.count_ready_all(),
-        "finalized_ready": cat.is_finalized_ready(),
-        "finalized_count": cat.count_ready("finalized"),
+        "local_only": snapshot["local_only"],
+        "provider": snapshot["provider"],
+        "data_root": snapshot["paths"]["data_root"],
+        "asset_count": snapshot["asset_count"],
+        "finalized_ready": snapshot["finalized_ready"],
+        "finalized_count": snapshot["finalized_count"],
     }
 
 
 @app.get("/api/v1/status")
 def status() -> dict:
-    s = get_settings()
-    cat = Catalog(s)
-    sync = cat.get_sync_state("finalized")
-    asset_count = cat.count_ready_all()
-    return {
-        "ready_for_pack": asset_count > 0,
-        "sync_complete": bool(sync.get("ready")),
-        "asset_count": asset_count,
-        "local_only": s.local_only,
-        "provider": s.provider,
-        "workers": s.workers,
-        "finalized_count": cat.count_ready("finalized"),
-        "archive_count": cat.count_ready("archive"),
-        "library_count": cat.count_ready("library"),
-        "sync": sync,
-        "paths": {
-            "data_root": str(s.data_root),
-            "finalized": str(s.finalized_dir),
-            "archive": str(s.archive_dir),
-            "jobs": str(s.jobs_dir),
-            "library": str(s.library_root),
-            "db": str(s.db_path),
-        },
-    }
+    return _status_snapshot()
 
 
 @app.get("/api/v1/search")
@@ -444,6 +471,22 @@ def delete_pack_rule(rule_id: str) -> dict:
 
 @app.get("/api/v1/jobs")
 def list_jobs(limit: int = 20) -> dict:
+    global _jobs_cache_at, _jobs_cache
+    now = time.monotonic()
+    if limit == 20 and now - _jobs_cache_at <= 0.5:
+        return _jobs_cache
+    with _jobs_cache_lock:
+        now = time.monotonic()
+        if limit == 20 and now - _jobs_cache_at <= 0.5:
+            return _jobs_cache
+        result = _list_jobs_uncached(limit)
+        if limit == 20:
+            _jobs_cache = result
+            _jobs_cache_at = now
+        return result
+
+
+def _list_jobs_uncached(limit: int) -> dict:
     store = JobStore()
     jobs = store.list(limit=limit)
     return {
@@ -537,15 +580,26 @@ def get_job(job_id: str) -> dict:
 @app.get("/api/v1/jobs/{job_id}/download")
 def download_job(job_id: str) -> Response:
     s = get_settings()
-    job = JobStore(s).get(job_id)
-    if not job:
-        raise HTTPException(404, "任务不存在")
-    if job.status != "done" or not job.archive_path:
-        raise HTTPException(409, "任务未完成")
-    path = Path(job.archive_path)
+    with _download_cache_lock:
+        cached = _download_cache.get(job_id)
+    if cached:
+        archive_path, download_name = cached
+        path = Path(archive_path)
+        name = download_name
+    else:
+        job = JobStore(s).get(job_id)
+        if not job:
+            raise HTTPException(404, "任务不存在")
+        if job.status != "done" or not job.archive_path:
+            raise HTTPException(409, "任务未完成")
+        path = Path(job.archive_path)
+        name = f"{Path(job.filename or job_id).stem}_pack.zip"
+        with _download_cache_lock:
+            _download_cache[job_id] = (str(path), name)
     if not path.is_file():
+        with _download_cache_lock:
+            _download_cache.pop(job_id, None)
         raise HTTPException(404, "结果文件不存在")
-    name = f"{Path(job.filename or job_id).stem}_pack.zip"
     return _serve_under_data(path, s.data_root, name)
 
 
@@ -567,6 +621,7 @@ def run() -> None:
         backlog=s.api.backlog,
         limit_concurrency=s.api.limit_concurrency,
         timeout_keep_alive=30,
+        access_log=False,
         log_level="info",
     )
 
