@@ -500,6 +500,12 @@ def test_manifest_reuses_existing_filename_without_download_candidate(settings):
     assert alias.dedup_of_asset_id == "upload:manual"
     assert catalog.ticket_candidates(include_nonready=True) == []
 
+    reapplied = catalog.apply_finalized_manifest([item], "manifest-dedupe-next")
+    assert reapplied["changed_objects"] == 0
+    assert reapplied["unchanged_objects"] == 1
+    assert reapplied["changed_items"] == 0
+    assert reapplied["unchanged_items"] == 1
+
     # If the original canonical row exits, the still-current alias must take
     # over the global filename claim instead of disappearing from the tree.
     catalog.mark_tombstone("upload:manual")

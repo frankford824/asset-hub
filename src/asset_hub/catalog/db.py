@@ -708,11 +708,22 @@ class Catalog:
                 )
 
         with self.connect() as conn:
-            before_current = int(
-                conn.execute(
-                    "SELECT COUNT(*) AS c FROM assets WHERE kind='finalized' AND deleted=0"
-                ).fetchone()["c"]
-            )
+            existing_assets = {
+                int(row["task_asset_id"]): row
+                for row in conn.execute(
+                    "SELECT * FROM assets WHERE kind='finalized' AND task_asset_id IS NOT NULL"
+                ).fetchall()
+            }
+            existing_items = {
+                int(row["revision_item_id"]): row
+                for row in conn.execute("SELECT * FROM finalized_items").fetchall()
+            }
+            before_current = sum(not int(row["deleted"] or 0) for row in existing_assets.values())
+            asset_ids: dict[int, str] = {}
+            changed_objects = 0
+            unchanged_objects = 0
+            changed_items = 0
+            unchanged_items = 0
             conn.execute(
                 "CREATE TEMP TABLE IF NOT EXISTS snapshot_task_assets "
                 "(task_asset_id INTEGER PRIMARY KEY)"
@@ -733,9 +744,10 @@ class Catalog:
             )
 
             for task_asset_id, item in objects.items():
-                previous = conn.execute(
-                    "SELECT * FROM assets WHERE task_asset_id=?", (task_asset_id,)
-                ).fetchone()
+                previous = existing_assets.get(task_asset_id)
+                virtual_path = normalize_virtual_path(
+                    f"{item.sku_code}/{item.file_name}" if item.sku_code else item.file_name
+                )
                 unchanged = bool(
                     previous
                     and not previous["deleted"]
@@ -743,10 +755,32 @@ class Catalog:
                     and int(previous["file_size"] or 0) == int(item.file_size)
                     and (previous["whole_hash"] or "") == (item.whole_hash or "")
                     and previous["file_name"] == item.file_name
+                    and previous["original_filename"]
+                    == (item.original_filename or item.file_name)
+                    and (previous["format"] or "") == (item.format or "")
+                    and (previous["mime_type"] or "") == (item.mime_type or "")
+                    and (previous["sku_code"] or "") == (item.sku_code or "")
+                    and (previous["sku_name"] or "") == (item.product_name or "")
+                    and (previous["virtual_path"] or "") == virtual_path
                     and float(previous["updated_at"] or 0)
                     == float(item.asset_updated_at or 0)
                 )
                 previous_asset_id = previous["asset_id"] if previous else f"finalized:{task_asset_id}"
+                local_valid = bool(
+                    previous
+                    and previous["status"] == "ready"
+                    and previous["local_path"]
+                    and Path(previous["local_path"]).is_file()
+                    and (
+                        bool(previous["dedup_of_asset_id"])
+                        or Path(previous["local_path"]).stat().st_size
+                        == int(item.file_size)
+                    )
+                )
+                if unchanged and local_valid:
+                    asset_ids[task_asset_id] = previous_asset_id
+                    unchanged_objects += 1
+                    continue
                 duplicate = conn.execute(
                     """
                     SELECT a.* FROM asset_name_claims c
@@ -758,9 +792,6 @@ class Catalog:
                 ).fetchone()
                 duplicate_valid = bool(
                     duplicate and Path(duplicate["local_path"]).is_file()
-                )
-                virtual_path = normalize_virtual_path(
-                    f"{item.sku_code}/{item.file_name}" if item.sku_code else item.file_name
                 )
                 asset = AssetRow(
                     asset_id=previous_asset_id,
@@ -804,6 +835,8 @@ class Catalog:
                     ),
                 )
                 self._upsert_asset(conn, asset)
+                asset_ids[task_asset_id] = previous_asset_id
+                changed_objects += 1
 
             exited_rows = conn.execute(
                 """
@@ -835,6 +868,38 @@ class Catalog:
                 self._promote_name_claim(conn, row["file_name"])
 
             for item in items:
+                previous_item = existing_items.get(int(item.revision_item_id))
+                item_values = (
+                    int(item.task_asset_id),
+                    int(item.group_id),
+                    int(item.revision_id),
+                    item.revision_mode,
+                    float(item.finalized_at),
+                    int(item.task_id),
+                    item.task_no,
+                    item.scope_kind,
+                    item.sku_code,
+                    item.product_name,
+                    int(item.sort_order),
+                    item.item_name,
+                )
+                previous_values = (
+                    int(previous_item["task_asset_id"]),
+                    int(previous_item["group_id"]),
+                    int(previous_item["revision_id"]),
+                    previous_item["revision_mode"],
+                    float(previous_item["finalized_at"]),
+                    int(previous_item["task_id"]),
+                    previous_item["task_no"],
+                    previous_item["scope_kind"],
+                    previous_item["sku_code"],
+                    previous_item["product_name"],
+                    int(previous_item["sort_order"]),
+                    previous_item["item_name"],
+                ) if previous_item else None
+                if previous_item and not int(previous_item["deleted"] or 0) and previous_values == item_values:
+                    unchanged_items += 1
+                    continue
                 conn.execute(
                     """
                     INSERT INTO finalized_items (
@@ -875,11 +940,7 @@ class Catalog:
                         manifest_id,
                     ),
                 )
-                asset_row = conn.execute(
-                    "SELECT asset_id FROM assets WHERE task_asset_id=?",
-                    (int(item.task_asset_id),),
-                ).fetchone()
-                asset_id = asset_row["asset_id"]
+                asset_id = asset_ids[int(item.task_asset_id)]
                 extra_tokens = extract_sku_tokens(
                     item.sku_code, item.product_name, item.item_name
                 )
@@ -887,6 +948,7 @@ class Catalog:
                     "INSERT OR IGNORE INTO sku_tokens(token, asset_id) VALUES (?,?)",
                     [(token, asset_id) for token in extra_tokens],
                 )
+                changed_items += 1
             conn.execute(
                 """
                 UPDATE finalized_items AS i
@@ -905,6 +967,10 @@ class Catalog:
                 "items": len(items),
                 "entered": max(0, after_current - (before_current - len(exited_rows))),
                 "exited": len(exited_rows),
+                "changed_objects": changed_objects,
+                "unchanged_objects": unchanged_objects,
+                "changed_items": changed_items,
+                "unchanged_items": unchanged_items,
             }
 
     def list_finalized_assets(self) -> list[AssetRow]:
