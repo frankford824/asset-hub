@@ -148,7 +148,7 @@ async function ensureTreePath(path) {
 function renderTree() {
   const renderNode = (name, path, depth) => {
     const expanded = state.expanded.has(path); const children = state.treeCache.get(path) || [];
-    return `<div><div class="tree-row ${state.path === path ? "active" : ""}" data-tree-path="${escapeHtml(path)}" style="padding-left:${7 + depth * 4}px"><span class="twisty">${children.length ? (expanded ? "▾" : "▸") : ""}</span><span class="folder-icon">▰</span><span>${escapeHtml(name)}</span></div>${expanded && children.length ? `<div class="tree-children">${children.map((child) => renderNode(child.name, child.path, depth + 1)).join("")}</div>` : ""}</div>`;
+    return `<div><div class="tree-row ${state.path === path ? "active" : ""}" data-tree-path="${escapeHtml(path)}" style="padding-left:${7 + depth * 4}px"><span class="twisty">${children.length ? (expanded ? "▾" : "▸") : ""}</span><span class="folder-icon">▰</span><span class="tree-name" title="${escapeHtml(name)}">${escapeHtml(name)}</span></div>${expanded && children.length ? `<div class="tree-children">${children.map((child) => renderNode(child.name, child.path, depth + 1)).join("")}</div>` : ""}</div>`;
   };
   $("#directory-tree").innerHTML = renderNode("素材库", "", 0);
   $$(".tree-row").forEach((row) => row.addEventListener("click", async (event) => {
