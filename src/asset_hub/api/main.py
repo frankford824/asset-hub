@@ -48,7 +48,10 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
     now = time.monotonic()
     if now - _status_cache_at <= max_age and _status_cache:
         return _status_cache
-    with _status_cache_lock:
+    acquired = _status_cache_lock.acquire(blocking=not bool(_status_cache))
+    if not acquired:
+        return _status_cache
+    try:
         now = time.monotonic()
         if now - _status_cache_at <= max_age and _status_cache:
             return _status_cache
@@ -81,6 +84,8 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
         }
         _status_cache_at = now
         return _status_cache
+    finally:
+        _status_cache_lock.release()
 
 
 def _x_accel(
@@ -475,7 +480,10 @@ def list_jobs(limit: int = 20) -> dict:
     now = time.monotonic()
     if limit == 20 and now - _jobs_cache_at <= 0.5:
         return _jobs_cache
-    with _jobs_cache_lock:
+    acquired = _jobs_cache_lock.acquire(blocking=_jobs_cache_at == 0.0)
+    if not acquired:
+        return _jobs_cache
+    try:
         now = time.monotonic()
         if limit == 20 and now - _jobs_cache_at <= 0.5:
             return _jobs_cache
@@ -484,6 +492,8 @@ def list_jobs(limit: int = 20) -> dict:
             _jobs_cache = result
             _jobs_cache_at = now
         return result
+    finally:
+        _jobs_cache_lock.release()
 
 
 def _list_jobs_uncached(limit: int) -> dict:
