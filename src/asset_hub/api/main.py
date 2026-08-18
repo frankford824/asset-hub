@@ -243,9 +243,19 @@ def library_tree(
     offset: int = 0,
 ) -> dict:
     clean = normalize_virtual_path(path)
-    directories, files, total = Catalog().list_directory(
-        clean, query=q, limit=limit, offset=offset
-    )
+    query = q.strip()
+    catalog = Catalog()
+    if query:
+        files, total = catalog.search(query, limit=limit, offset=offset)
+        if clean:
+            prefix = clean + "/"
+            files = [asset for asset in files if asset.virtual_path.startswith(prefix)]
+            total = len(files)
+        directories = []
+    else:
+        directories, files, total = catalog.list_directory(
+            clean, limit=limit, offset=offset
+        )
     parts = clean.split("/") if clean else []
     breadcrumbs = [{"name": "素材库", "path": ""}]
     for index, part in enumerate(parts):
@@ -257,6 +267,7 @@ def library_tree(
         "files": [_asset_json(asset) for asset in files],
         "total_files": total,
         "has_more": offset + len(files) < total,
+        "search_mode": bool(query),
     }
 
 

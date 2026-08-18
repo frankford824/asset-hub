@@ -163,14 +163,14 @@ async function loadLibrary(path, { append = false, pushHistory = false } = {}) {
   if (!append) { state.offset = 0; state.selected.clear(); state.focusedId = null; state.batchDownloadUrl = ""; }
   const data = await fetchTree(clean, 200, offset);
   state.directories = data.directories || []; state.files = append ? [...state.files, ...(data.files || [])] : (data.files || []);
-  state.hasMore = Boolean(data.has_more); state.treeCache.set(clean, state.directories);
+  state.hasMore = Boolean(data.has_more); if (!state.query) state.treeCache.set(clean, state.directories);
   await ensureTreePath(clean); if (pushHistory && state.history[state.historyIndex] !== clean) { state.history = state.history.slice(0, state.historyIndex + 1); state.history.push(clean); state.historyIndex += 1; }
   renderBreadcrumbs(data.breadcrumbs || []); renderTree(); renderLibrary(); updateSelection();
 }
 function navigate(path) { loadLibrary(path, { pushHistory: true }).catch(showError); }
 function renderBreadcrumbs(items) { $("#breadcrumbs").innerHTML = items.map((item) => `<button type="button" data-path="${escapeHtml(item.path)}">${escapeHtml(item.name)}</button>`).join(""); $$("button", $("#breadcrumbs")).forEach((button) => button.addEventListener("click", () => navigate(button.dataset.path))); }
 function renderLibrary() {
-  $("#folder-title").textContent = state.path.split("/").pop() || "素材库";
+  $("#folder-title").textContent = state.query ? `搜索：${state.query}` : (state.path.split("/").pop() || "素材库");
   $("#folder-count").textContent = `${state.directories.length} 个目录 · ${state.files.length}${state.hasMore ? "+" : ""} 个文件`;
   $("#folder-grid").innerHTML = state.directories.map((folder) => `<div class="folder-tile" data-path="${escapeHtml(folder.path)}"><span class="folder-art">▰</span><span><strong title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</strong><small>${folder.file_count || 0} 个文件</small></span></div>`).join("");
   $$(".folder-tile").forEach((tile) => { tile.addEventListener("dblclick", () => navigate(tile.dataset.path)); tile.addEventListener("click", () => { $$(".folder-tile").forEach((item) => item.classList.remove("selected")); tile.classList.add("selected"); }); });
@@ -260,7 +260,11 @@ $("#pack-form").addEventListener("submit", submitPack); $("#refresh-jobs").addEv
 $("#excel").addEventListener("change", (event) => { $("#excel-label").textContent = event.target.files[0]?.name || "拖入订单 Excel，或点击选择"; });
 const excelDrop = $("#excel-drop"); ["dragenter", "dragover"].forEach((name) => excelDrop.addEventListener(name, (event) => { event.preventDefault(); excelDrop.classList.add("dragging"); })); ["dragleave", "drop"].forEach((name) => excelDrop.addEventListener(name, () => excelDrop.classList.remove("dragging")));
 $("#nav-home").addEventListener("click", () => navigate("")); $("#nav-up").addEventListener("click", () => navigate(state.path.split("/").slice(0,-1).join("/"))); $("#nav-back").addEventListener("click", () => { if (state.historyIndex <= 0) return; state.historyIndex -= 1; loadLibrary(state.history[state.historyIndex]).catch(showError); });
-$("#library-search").addEventListener("input", (event) => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => { state.query = event.target.value.trim(); loadLibrary(state.path).catch(showError); }, 250); });
+const librarySearch = $("#library-search");
+function submitLibrarySearch() { clearTimeout(state.searchTimer); state.query = librarySearch.value.trim(); loadLibrary(state.path).catch(showError); }
+librarySearch.addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(submitLibrarySearch, 250); });
+librarySearch.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); submitLibrarySearch(); } });
+librarySearch.addEventListener("search", submitLibrarySearch);
 $("#upload-files").addEventListener("click", () => $("#file-picker").click()); $("#upload-folder").addEventListener("click", () => $("#folder-picker").click());
 $("#file-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.name }))).finally(() => { event.target.value = ""; })); $("#folder-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.webkitRelativePath || file.name }))).finally(() => { event.target.value = ""; }));
 const canvas = $("#file-canvas"); canvas.addEventListener("pointerdown", beginRectangle); canvas.addEventListener("pointermove", moveRectangle); canvas.addEventListener("pointerup", endRectangle); canvas.addEventListener("pointercancel", endRectangle);

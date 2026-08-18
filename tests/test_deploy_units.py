@@ -40,6 +40,13 @@ def test_worker_pool_has_one_graceful_shutdown_deadline():
     assert "TimeoutStopSec=300" in unit
 
 
+def test_library_search_supports_enter_and_clear():
+    app = (ROOT / "web/dist/app.js").read_text()
+
+    assert 'event.key === "Enter"' in app
+    assert 'librarySearch.addEventListener("search", submitLibrarySearch)' in app
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 

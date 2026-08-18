@@ -587,6 +587,37 @@ def test_library_upload_tree_and_global_filename_dedupe(settings):
     assert not (settings.library_root / "另一个目录" / "manual.png").exists()
 
 
+def test_library_tree_search_finds_nested_sku_from_root(settings):
+    catalog = Catalog(settings)
+    local = settings.library_root / "水晶标" / "HSC38018——生日套装" / "第一张【25x35cm】.jpg"
+    local.parent.mkdir(parents=True)
+    local.write_bytes(b"nested-image")
+    catalog.upsert_asset(
+        AssetRow(
+            asset_id="lib:水晶标/HSC38018——生日套装/第一张【25x35cm】.jpg",
+            kind="library",
+            storage_key="水晶标/HSC38018——生日套装/第一张【25x35cm】.jpg",
+            file_name=local.name,
+            original_filename=local.name,
+            file_size=local.stat().st_size,
+            local_path=str(local),
+            status="ready",
+            virtual_path="水晶标/HSC38018——生日套装/第一张【25x35cm】.jpg",
+        )
+    )
+    from asset_hub.api.main import app
+
+    response = TestClient(app).get(
+        "/api/v1/library/tree", params={"path": "", "q": "HSC38018"}
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["search_mode"] is True
+    assert data["directories"] == []
+    assert data["total_files"] == 1
+    assert data["files"][0]["virtual_path"].startswith("水晶标/HSC38018")
+
+
 def test_manifest_same_filename_different_content_requires_own_ticket(settings):
     local = settings.library_root / "SAME-NAME.jpg"
     local.write_bytes(b"manual-content")
