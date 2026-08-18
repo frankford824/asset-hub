@@ -33,6 +33,13 @@ def test_nginx_download_path_uses_sendfile_without_directio():
     assert "directio" not in nginx
 
 
+def test_worker_pool_has_one_graceful_shutdown_deadline():
+    unit = (ROOT / "deploy/systemd/asset-hub-worker.service").read_text()
+
+    assert "KillMode=mixed" in unit
+    assert "TimeoutStopSec=300" in unit
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 

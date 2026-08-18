@@ -331,8 +331,6 @@ def run() -> None:
     def request_stop(_signum, _frame) -> None:
         stop_event.set()
 
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
     processes = [
         context.Process(
             target=_worker_loop,
@@ -343,6 +341,10 @@ def run() -> None:
     ]
     for process in processes:
         process.start()
+    # Install handlers only in the supervisor. With systemd KillMode=mixed,
+    # children finish their current job and observe stop_event normally.
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
     log.warning(
         "worker pool started processes=%s requeued=%s",
         worker_count,
@@ -359,8 +361,9 @@ def run() -> None:
                     break
     finally:
         stop_event.set()
+        deadline = time.monotonic() + 290
         for process in processes:
-            process.join(timeout=300)
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
         for process in processes:
             if process.is_alive():
                 process.terminate()
