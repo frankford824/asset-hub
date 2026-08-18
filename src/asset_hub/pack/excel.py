@@ -207,7 +207,16 @@ def match_assets_for_rows(
             selected = catalog.order_current_assets(current)
             policy, label = "preferred_current", "当前优选"
         elif fallback and "library_fallback" in handlers:
-            selected = fallback
+            first = fallback[0]
+            first_parent = Path(first.virtual_path).parent if first.virtual_path else Path()
+            if q.casefold() in first_parent.name.casefold():
+                selected = [
+                    asset
+                    for asset in fallback
+                    if Path(asset.virtual_path).parent == first_parent
+                ]
+            else:
+                selected = [first]
             policy, label = "library_fallback", "库内兜底"
         elif available:
             selected = available

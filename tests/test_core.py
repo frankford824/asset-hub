@@ -366,6 +366,68 @@ def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(se
     assert done.progress["matched"] == 3
 
 
+def test_pack_chooses_one_best_file_for_repeated_sku_outside_product_directory(settings):
+    catalog = Catalog(settings)
+    parent = settings.library_root / "冯新妮皮普和波西KT板"
+    parent.mkdir(parents=True)
+    candidates = [
+        ("HQT03449—波西和皮普—高80cm(外发).jpg", 40.0),
+        ("HQT03449—波西和皮普—高80cm(多个).jpg", 30.0),
+        ("HQT03449—波西和皮普—高80cm.jpg", 20.0),
+        ("HQT03449—波西和皮普—高80cm._jg", 10.0),
+    ]
+    for name, updated_at in candidates:
+        path = parent / name
+        path.write_bytes(name.encode())
+        rel = path.relative_to(settings.library_root).as_posix()
+        catalog.upsert_asset(
+            AssetRow(
+                asset_id=f"lib:{rel}",
+                kind="library",
+                storage_key=rel,
+                file_name=name,
+                original_filename=name,
+                file_size=path.stat().st_size,
+                local_path=str(path),
+                status="ready",
+                updated_at=updated_at,
+                virtual_path=rel,
+            )
+        )
+
+    xlsx = settings.tmp_dir / "repeated-single.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["编码"])
+    sheet.append(["HQT03449"])
+    sheet.append(["HQT03449"])
+    workbook.save(xlsx)
+    rules = [
+        {"name": "库内素材兜底", "handler": "library_fallback"},
+        {"name": "保留商品名称与尺寸", "handler": "rename_sku_sequence"},
+        {"name": "媒体文件快速打包", "handler": "fast_zip"},
+    ]
+    store = JobStore(settings)
+    job = store.create(filename=xlsx.name, super_dir_name="pack", meta={"rules": rules})
+    job_dir = store.job_dir(job.id)
+    (job_dir / "input.xlsx").write_bytes(xlsx.read_bytes())
+    claimed = store.claim_next()
+    assert claimed is not None
+    from asset_hub.worker.main import process_job
+
+    process_job(store, catalog, claimed.id)
+    done = store.get(claimed.id)
+    assert done is not None and done.status == "done"
+    import zipfile
+
+    with zipfile.ZipFile(done.archive_path) as archive:
+        files = [name for name in archive.namelist() if name.lower().endswith(".jpg")]
+    assert files == [
+        "pack/HQT03449—波西和皮普—高80cm(外发)_1.jpg",
+        "pack/HQT03449—波西和皮普—高80cm(外发)_2.jpg",
+    ]
+
+
 def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
     catalog = Catalog(settings)
     key = str(catalog.db_path.resolve())
