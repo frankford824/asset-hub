@@ -73,18 +73,20 @@ sync_code() {
   if [[ "${SKIP_SYNC_CODE}" == "1" ]]; then
     log "跳过代码同步（SKIP_SYNC_CODE=1）；假定 ${ASSET_HUB_ROOT} 已就绪"
     [[ -d "${ASSET_HUB_ROOT}" ]] || die "${ASSET_HUB_ROOT} 不存在"
-    return
+  else
+    log "同步代码 ${REPO_DIR} → ${ASSET_HUB_ROOT}"
+    mkdir -p "${ASSET_HUB_ROOT}"
+    rsync -a --delete \
+      --exclude '.git/' \
+      --exclude '.venv/' \
+      --exclude 'web/node_modules/' \
+      --exclude '__pycache__/' \
+      --exclude '*.pyc' \
+      --exclude '.pytest_cache/' \
+      "${REPO_DIR}/" "${ASSET_HUB_ROOT}/"
   fi
-  log "同步代码 ${REPO_DIR} → ${ASSET_HUB_ROOT}"
-  mkdir -p "${ASSET_HUB_ROOT}"
-  rsync -a --delete \
-    --exclude '.git/' \
-    --exclude '.venv/' \
-    --exclude 'web/node_modules/' \
-    --exclude '__pycache__/' \
-    --exclude '*.pyc' \
-    --exclude '.pytest_cache/' \
-    "${REPO_DIR}/" "${ASSET_HUB_ROOT}/"
+  # nginx 静态站点必须能穿越代码根目录；0751 不开放目录列表。
+  chmod 751 "${ASSET_HUB_ROOT}"
 }
 
 make_dirs() {
