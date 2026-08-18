@@ -6,7 +6,7 @@ import os
 import re
 import signal
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from pathlib import Path
 
 from asset_hub.catalog.db import Catalog
@@ -76,7 +76,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         store.update(job_id, progress={"percent": 10, "label": "解析 Excel"})
         phase_started = time.perf_counter()
         input_rows = read_excel_rows(excel_path)
-        rows, duplicate_rows = deduplicate_rows(input_rows)
+        unique_rows, duplicate_rows = deduplicate_rows(input_rows)
+        rows = input_rows
         timings["parse_s"] = round(time.perf_counter() - phase_started, 4)
         phase_started = time.perf_counter()
         matched, missing = match_assets_for_rows(
@@ -92,7 +93,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             block["selection_policy"] == "library_fallback" for block in matched
         )
         summary = (
-            f"收到 {len(input_rows)} 行 · 唯一 {len(rows)} 行 · "
+            f"收到 {len(input_rows)} 行 · 唯一 {len(unique_rows)} 个编码 · "
+            f"重复 {len(duplicate_rows)} 行按次输出 · "
             f"匹配 {len(matched)} 行 · 优选 {preferred_rows} 行 · "
             f"兜底 {fallback_rows} 行 · 缺失 {len(missing)} 行"
         )
@@ -106,7 +108,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 "preferred_rows": preferred_rows,
                 "fallback_rows": fallback_rows,
                 "input_rows": len(input_rows),
-                "unique_rows": len(rows),
+                "unique_rows": len(unique_rows),
                 "duplicate_rows": len(duplicate_rows),
             },
         )
@@ -119,8 +121,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         selection_lines = [
             "统一素材库选择说明",
             f"输入编码行：{len(input_rows)}",
-            f"唯一业务行：{len(rows)}",
-            f"重复行：{len(duplicate_rows)}",
+            f"唯一编码：{len(unique_rows)}",
+            f"重复行：{len(duplicate_rows)}（不合并，按出现次数分别输出）",
             "本任务采用的规则：" + "、".join(
                 str(rule.get("name"))
                 for rule in ((job.meta or {}).get("rules") or [])
@@ -132,7 +134,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             row = duplicate["row"]
             selection_lines.append(
                 f"第 {row.row_index} 行 · {row.sku_code or row.sku_name} · "
-                f"与第 {duplicate['first_row_index']} 行重复，已合并"
+                f"与第 {duplicate['first_row_index']} 行编码重复，保留为独立商品单位"
             )
         if duplicate_rows:
             selection_lines.append("")
@@ -140,6 +142,12 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         for group_index, (order_id, group_rows) in enumerate(
             _group_rows(rows, handlers).items(), start=1
         ):
+            group_skus = [
+                _safe_component(row.sku_code or row.sku_name, f"row{row.row_index}")
+                for row in group_rows
+            ]
+            sku_totals = Counter(group_skus)
+            sku_seen: Counter[str] = Counter()
             group_missing = [
                 missing_by_row[row.row_index]
                 for row in group_rows
@@ -171,6 +179,10 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 if not assets:
                     continue
                 sku = _safe_component(row.sku_code or row.sku_name, f"row{row.row_index}")
+                sku_seen[sku] += 1
+                instance_suffix = (
+                    f"_{sku_seen[sku]}" if sku_totals[sku] > 1 else ""
+                )
                 copies = row.quantity if "repeat_quantity" in handlers else 1
                 product_groups: OrderedDict[str, list] = OrderedDict()
                 for asset in assets:
@@ -182,21 +194,34 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                         and parent.casefold() != sku.casefold()
                         else ""
                     )
+                    if not descriptive_parent and (
+                        len(assets) > 1 or sku.casefold() not in asset.file_name.casefold()
+                    ):
+                        product_name = (asset.sku_name or "").strip()
+                        if product_name:
+                            descriptive_parent = (
+                                product_name
+                                if sku.casefold() in product_name.casefold()
+                                else f"{sku}——{product_name}"
+                            )
                     product_groups.setdefault(descriptive_parent, []).append(asset)
                 should_group = len(assets) > 1 or any(product_groups)
                 if should_group and "rename_sku_sequence" in handlers:
                     for copy_index in range(1, copies + 1):
                         for product_parent, grouped_assets in product_groups.items():
                             folder = _safe_component(product_parent, sku)
+                            folder += instance_suffix
                             if copies > 1:
-                                folder += f"_{copy_index}"
+                                folder += f"_copy{copy_index}"
                             for asset in grouped_assets:
                                 src = Path(asset.local_path)
                                 pairs.append((src, f"{base}/{folder}/{src.name}"))
                 elif "rename_sku_sequence" in handlers:
                     src = Path(assets[0].local_path)
                     for copy_index in range(1, copies + 1):
-                        suffix = f"_{copy_index}" if copies > 1 else ""
+                        suffix = instance_suffix
+                        if copies > 1:
+                            suffix += f"_copy{copy_index}"
                         output_name = f"{src.stem}{suffix}{src.suffix.lower()}"
                         pairs.append((src, f"{base}/{output_name}"))
                 else:
@@ -258,7 +283,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 "preferred_rows": preferred_rows,
                 "fallback_rows": fallback_rows,
                 "input_rows": len(input_rows),
-                "unique_rows": len(rows),
+                "unique_rows": len(unique_rows),
                 "duplicate_rows": len(duplicate_rows),
                 "archive_bytes": archive.stat().st_size,
                 "timings": timings,

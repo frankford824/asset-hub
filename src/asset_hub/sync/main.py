@@ -170,25 +170,6 @@ def _process_ticket(
         log.error("invalid ready ticket task_asset_id=%s error=%s", task_asset_id, exc)
         return False
     try:
-        duplicate = catalog.find_asset_by_name(
-            asset.file_name, exclude_asset_id=asset.asset_id
-        )
-        if duplicate:
-            destination = Path(duplicate.local_path)
-            catalog.mark_task_asset_status(
-                task_asset_id,
-                "ready",
-                local_path=str(destination),
-                etag=ticket.etag,
-                crc64_ecma=ticket.crc64_ecma,
-                dedup_of_asset_id=duplicate.asset_id,
-                retryable=False,
-                error="",
-            )
-            stats["deduplicated"] += 1
-            stats["skipped"] += 1
-            stats["ready"] += 1
-            return True
         if _ticket_matches_local(asset, ticket):
             destination = Path(asset.local_path)
             stats["skipped"] += 1
@@ -204,6 +185,7 @@ def _process_ticket(
             local_path=str(destination),
             etag=ticket.etag,
             crc64_ecma=ticket.crc64_ecma,
+            dedup_of_asset_id="",
             retryable=False,
             error="",
         )

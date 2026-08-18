@@ -165,10 +165,22 @@ def match_assets_for_rows(
             missing.append({"row": row, "query": q, "reason": "SKU 格式错误"})
             continue
         hits, _total = catalog.search(q, limit=limit_per_row) if q else ([], 0)
-        available = [hit for hit in hits if hit.local_path and Path(hit.local_path).is_file()]
+        available = [
+            hit
+            for hit in hits
+            if hit.local_path
+            and Path(hit.local_path).is_file()
+            and Path(hit.local_path).stat().st_size == hit.file_size
+        ]
         if not available and row.sku_name and row.sku_name != q:
             hits, _total = catalog.search(row.sku_name, limit=limit_per_row)
-            available = [hit for hit in hits if hit.local_path and Path(hit.local_path).is_file()]
+            available = [
+                hit
+                for hit in hits
+                if hit.local_path
+                and Path(hit.local_path).is_file()
+                and Path(hit.local_path).stat().st_size == hit.file_size
+            ]
         unique_available = []
         seen_paths: set[str] = set()
         for hit in available:

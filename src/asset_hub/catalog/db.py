@@ -815,30 +815,16 @@ class Catalog:
                 local_valid = bool(
                     previous
                     and previous["status"] == "ready"
+                    and not previous["dedup_of_asset_id"]
                     and previous["local_path"]
                     and Path(previous["local_path"]).is_file()
-                    and (
-                        bool(previous["dedup_of_asset_id"])
-                        or Path(previous["local_path"]).stat().st_size
-                        == int(item.file_size)
-                    )
+                    and Path(previous["local_path"]).stat().st_size
+                    == int(item.file_size)
                 )
                 if unchanged and local_valid:
                     asset_ids[task_asset_id] = previous_asset_id
                     unchanged_objects += 1
                     continue
-                duplicate = conn.execute(
-                    """
-                    SELECT a.* FROM asset_name_claims c
-                    JOIN assets a ON a.asset_id=c.asset_id
-                    WHERE c.normalized_name=? AND a.asset_id<>?
-                      AND a.deleted=0 AND a.status='ready' AND a.local_path<>''
-                    """,
-                    (normalize_file_name(item.file_name), previous_asset_id),
-                ).fetchone()
-                duplicate_valid = bool(
-                    duplicate and Path(duplicate["local_path"]).is_file()
-                )
                 asset = AssetRow(
                     asset_id=previous_asset_id,
                     task_asset_id=task_asset_id,
@@ -854,31 +840,15 @@ class Catalog:
                     mime_type=item.mime_type,
                     sku_code=item.sku_code,
                     sku_name=item.product_name,
-                    local_path=(
-                        duplicate["local_path"]
-                        if duplicate_valid
-                        else ((previous["local_path"] or "") if unchanged else "")
-                    ),
-                    status=(
-                        "ready"
-                        if duplicate_valid
-                        else ((previous["status"] or "pending") if unchanged else "pending")
-                    ),
+                    local_path=(previous["local_path"] or "") if unchanged else "",
+                    status=(previous["status"] or "pending") if local_valid else "pending",
                     updated_at=float(item.asset_updated_at or time.time()),
                     deleted=0,
-                    retryable=(
-                        0
-                        if duplicate_valid
-                        else (int(previous["retryable"] or 0) if unchanged else 1)
-                    ),
+                    retryable=int(previous["retryable"] or 0) if local_valid else 1,
                     last_error=(previous["last_error"] or "") if unchanged else "",
                     manifest_id=manifest_id,
                     virtual_path=virtual_path,
-                    dedup_of_asset_id=(
-                        duplicate["asset_id"]
-                        if duplicate_valid
-                        else ((previous["dedup_of_asset_id"] or "") if unchanged else "")
-                    ),
+                    dedup_of_asset_id="",
                 )
                 self._upsert_asset(conn, asset)
                 asset_ids[task_asset_id] = previous_asset_id
@@ -1057,10 +1027,8 @@ class Catalog:
             local_valid = bool(
                 row.local_path
                 and Path(row.local_path).is_file()
-                and (
-                    bool(row.dedup_of_asset_id)
-                    or Path(row.local_path).stat().st_size == row.file_size
-                )
+                and not row.dedup_of_asset_id
+                and Path(row.local_path).stat().st_size == row.file_size
             )
             if (
                 verify_all
@@ -1147,8 +1115,10 @@ class Catalog:
             if asset.status != "ready" or not asset.local_path:
                 return False
             path = Path(asset.local_path)
-            if not path.is_file() or (
-                not asset.dedup_of_asset_id and path.stat().st_size != asset.file_size
+            if (
+                not path.is_file()
+                or asset.dedup_of_asset_id
+                or path.stat().st_size != asset.file_size
             ):
                 return False
         return True
@@ -1255,9 +1225,7 @@ class Catalog:
             base = """
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
-              LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id
               WHERE t.token=? AND a.deleted=0 AND a.status='ready'
-                AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
             """
             args = [token]
             if kind:
@@ -1292,10 +1260,8 @@ class Catalog:
                     fts_term = f"{match}*"
                 base = """
                   FROM assets a
-                  LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id
                   JOIN assets_fts f ON f.asset_id=a.asset_id
                   WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
-                    AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
                 """
                 args2: list = [fts_term]
                 if kind:
@@ -1323,7 +1289,6 @@ class Catalog:
                     a.file_name LIKE ? OR a.original_filename LIKE ?
                     OR a.sku_code LIKE ? OR a.storage_key LIKE ?
                   )
-                  AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
                 """
                 args3: list = [like, like, like, like]
                 if kind:
@@ -1331,11 +1296,11 @@ class Catalog:
                     args3.append(kind)
                 total = int(
                     conn.execute(
-                        f"SELECT COUNT(*) AS c FROM assets a LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where}", args3
+                        f"SELECT COUNT(*) AS c FROM assets a WHERE {where}", args3
                     ).fetchone()["c"]
                 )
                 rows = conn.execute(
-                    f"SELECT a.* FROM assets a LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
+                    f"SELECT a.* FROM assets a WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args3, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total

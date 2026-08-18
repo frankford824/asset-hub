@@ -158,25 +158,28 @@ def test_unified_match_prefers_current_and_falls_back(settings, tmp_path):
         AssetRow(
             asset_id="finalized:30001",
             task_asset_id=30001,
-            kind="finalized",
-            file_name=current.name,
-            sku_code="HQT30001",
+                kind="finalized",
+                file_name=current.name,
+                file_size=current.stat().st_size,
+                sku_code="HQT30001",
             local_path=str(current),
             status="ready",
         ),
         AssetRow(
             asset_id="lib:HQT30001.jpg",
-            kind="library",
-            file_name=fallback_same.name,
-            sku_code="HQT30001",
+                kind="library",
+                file_name=fallback_same.name,
+                file_size=fallback_same.stat().st_size,
+                sku_code="HQT30001",
             local_path=str(fallback_same),
             status="ready",
         ),
         AssetRow(
             asset_id="lib:HQT30002.jpg",
-            kind="library",
-            file_name=fallback_only.name,
-            sku_code="HQT30002",
+                kind="library",
+                file_name=fallback_only.name,
+                file_size=fallback_only.stat().st_size,
+                sku_code="HQT30002",
             local_path=str(fallback_only),
             status="ready",
         ),
@@ -260,7 +263,48 @@ def test_index_searches_sku_from_product_directory_with_generic_names(settings):
     }
 
 
-def test_pack_preserves_product_names_groups_multi_image_and_merges_duplicates(settings):
+def test_search_does_not_hide_current_assets_with_same_generic_filename(settings):
+    catalog = Catalog(settings)
+    first = settings.finalized_dir / "1" / "第一块【42x50cm】.jpg"
+    second = settings.finalized_dir / "2" / "第一块【42x50cm】.jpg"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"first-content")
+    second.write_bytes(b"second-content")
+    catalog.upsert_assets(
+        [
+            AssetRow(
+                asset_id="finalized:1",
+                task_asset_id=1,
+                kind="finalized",
+                file_name=first.name,
+                file_size=first.stat().st_size,
+                sku_code="CGK000001",
+                sku_name="商品一/3个装",
+                local_path=str(first),
+                status="ready",
+                virtual_path=f"CGK000001/{first.name}",
+            ),
+            AssetRow(
+                asset_id="finalized:2",
+                task_asset_id=2,
+                kind="finalized",
+                file_name=second.name,
+                file_size=second.stat().st_size,
+                sku_code="CGK000002",
+                sku_name="商品二/3个装",
+                local_path=str(second),
+                status="ready",
+                virtual_path=f"CGK000002/{second.name}",
+            ),
+        ]
+    )
+    hits, total = catalog.search("CGK000002", limit=20)
+    assert total == 1
+    assert hits[0].asset_id == "finalized:2"
+
+
+def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(settings):
     root = settings.library_root
     product_name = "HSC36004——蔡谦-常规水晶标-喜字酒杯款-直径45cm"
     product = root / "水晶标" / product_name
@@ -306,17 +350,20 @@ def test_pack_preserves_product_names_groups_multi_image_and_merges_duplicates(s
 
     with zipfile.ZipFile(done.archive_path) as archive:
         names = archive.namelist()
-        assert f"pack/{product_name}/第一张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}/第二张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_1/第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_1/第二张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_2/第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_2/第二张【25x35cm】.jpg" in names
         assert f"pack/{single_name}" in names
         assert not any("HSC36004_1" in name or "HSC36004_2" in name for name in names)
         report = archive.read("pack/素材选择说明.txt").decode("utf-8")
         assert "输入编码行：3" in report
-        assert "唯一业务行：2" in report
-        assert "与第 2 行重复，已合并" in report
+        assert "唯一编码：2" in report
+        assert "与第 2 行编码重复，保留为独立商品单位" in report
     assert done.progress["input_rows"] == 3
     assert done.progress["unique_rows"] == 2
     assert done.progress["duplicate_rows"] == 1
+    assert done.progress["matched"] == 3
 
 
 def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
@@ -540,7 +587,7 @@ def test_library_upload_tree_and_global_filename_dedupe(settings):
     assert not (settings.library_root / "另一个目录" / "manual.png").exists()
 
 
-def test_manifest_reuses_existing_filename_without_download_candidate(settings):
+def test_manifest_same_filename_different_content_requires_own_ticket(settings):
     local = settings.library_root / "SAME-NAME.jpg"
     local.write_bytes(b"manual-content")
     catalog = Catalog(settings)
@@ -579,31 +626,18 @@ def test_manifest_reuses_existing_filename_without_download_candidate(settings):
         sort_order=0,
         item_name="主图",
     )
-    catalog.apply_finalized_manifest([item], "manifest-dedupe")
+    catalog.apply_finalized_manifest([item], "manifest-own-object")
     alias = catalog.get_asset_by_task_asset_id(88001)
-    assert alias and alias.status == "ready"
-    assert alias.local_path == str(local)
-    assert alias.dedup_of_asset_id == "upload:manual"
-    assert catalog.ticket_candidates(include_nonready=True) == []
+    assert alias and alias.status == "pending"
+    assert alias.local_path == ""
+    assert alias.dedup_of_asset_id == ""
+    assert [row.task_asset_id for row in catalog.ticket_candidates(include_nonready=True)] == [88001]
 
-    reapplied = catalog.apply_finalized_manifest([item], "manifest-dedupe-next")
-    assert reapplied["changed_objects"] == 0
-    assert reapplied["unchanged_objects"] == 1
+    reapplied = catalog.apply_finalized_manifest([item], "manifest-own-object-next")
+    assert reapplied["changed_objects"] == 1
+    assert reapplied["unchanged_objects"] == 0
     assert reapplied["changed_items"] == 0
     assert reapplied["unchanged_items"] == 1
-
-    # If the original canonical row exits, the still-current alias must take
-    # over the global filename claim instead of disappearing from the tree.
-    catalog.mark_tombstone("upload:manual")
-    promoted = catalog.find_asset_by_name("same-name.JPG")
-    assert promoted and promoted.asset_id == alias.asset_id
-    _folders, files, total = catalog.list_directory("SAME88001")
-    assert total == 1
-    assert files[0].asset_id == alias.asset_id
-    duplicate = catalog.reserve_asset_names(
-        [("SAME-NAME.jpg", "upload:should-not-reserve")]
-    )
-    assert duplicate[0]["asset_id"] == alias.asset_id
 
 
 def test_pack_rule_crud_and_job_snapshot(settings):

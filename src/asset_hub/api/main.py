@@ -594,6 +594,7 @@ def create_job(
         "job_id": job.id,
         "input_rows": len(input_rows),
         "unique_rows": len(unique_rows),
+        "duplicate_rows": len(duplicate_rows),
         "duplicate_codes": duplicate_codes,
     }
 
