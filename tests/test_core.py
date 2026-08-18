@@ -15,6 +15,8 @@ from asset_hub.config import Settings, ensure_data_dirs, get_settings
 from asset_hub.jobs import JobStore
 from asset_hub.pack.excel import ExcelRow, match_assets_for_rows, read_excel_rows
 from asset_hub.pack.ziputil import zip_paths
+from asset_hub.pack.rules import PackRuleStore
+from asset_hub.sync.provider import ManifestItem
 from asset_hub.sync.main import sync_once
 
 
@@ -322,3 +324,132 @@ def test_create_job_allows_library_fallback_before_sync_complete(settings):
     )
     assert response.status_code == 200
     assert response.json()["job_id"]
+
+
+def test_library_upload_tree_and_global_filename_dedupe(settings):
+    from asset_hub.api.main import app
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/library/upload",
+        data={"target_path": "产品图/主图", "relative_paths": '["manual.png"]'},
+        files=[("files", ("manual.png", b"png-data", "image/png"))],
+    )
+    assert response.status_code == 200
+    assert response.json()["added"] == 1
+
+    tree = client.get("/api/v1/library/tree", params={"path": "产品图/主图"})
+    assert tree.status_code == 200
+    assert tree.json()["files"][0]["virtual_path"] == "产品图/主图/manual.png"
+
+    duplicate = client.post(
+        "/api/v1/library/upload",
+        data={"target_path": "另一个目录", "relative_paths": '["manual.png"]'},
+        files=[("files", ("manual.png", b"different", "image/png"))],
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"]["code"] == "FILENAME_DUPLICATE"
+    assert len(duplicate.json()["detail"]["duplicates"]) == 1
+    assert not (settings.library_root / "另一个目录" / "manual.png").exists()
+
+
+def test_manifest_reuses_existing_filename_without_download_candidate(settings):
+    local = settings.library_root / "SAME-NAME.jpg"
+    local.write_bytes(b"manual-content")
+    catalog = Catalog(settings)
+    catalog.upsert_asset(
+        AssetRow(
+            asset_id="upload:manual",
+            kind="library",
+            file_name=local.name,
+            original_filename=local.name,
+            file_size=local.stat().st_size,
+            local_path=str(local),
+            status="ready",
+            virtual_path="手动/SAME-NAME.jpg",
+        )
+    )
+    item = ManifestItem(
+        task_asset_id=88001,
+        storage_key="tasks/88/SAME-NAME.jpg",
+        file_name="SAME-NAME.jpg",
+        original_filename="SAME-NAME.jpg",
+        file_size=999999,
+        whole_hash="",
+        asset_updated_at=time.time(),
+        format="jpg",
+        mime_type="image/jpeg",
+        group_id=88,
+        revision_id=89,
+        revision_mode="single",
+        finalized_at=time.time(),
+        task_id=90,
+        task_no="T-90",
+        scope_kind="sku",
+        sku_code="SAME88001",
+        product_name="同名素材",
+        revision_item_id=91,
+        sort_order=0,
+        item_name="主图",
+    )
+    catalog.apply_finalized_manifest([item], "manifest-dedupe")
+    alias = catalog.get_asset_by_task_asset_id(88001)
+    assert alias and alias.status == "ready"
+    assert alias.local_path == str(local)
+    assert alias.dedup_of_asset_id == "upload:manual"
+    assert catalog.ticket_candidates(include_nonready=True) == []
+
+    # If the original canonical row exits, the still-current alias must take
+    # over the global filename claim instead of disappearing from the tree.
+    catalog.mark_tombstone("upload:manual")
+    promoted = catalog.find_asset_by_name("same-name.JPG")
+    assert promoted and promoted.asset_id == alias.asset_id
+    _folders, files, total = catalog.list_directory("SAME88001")
+    assert total == 1
+    assert files[0].asset_id == alias.asset_id
+    duplicate = catalog.reserve_asset_names(
+        [("SAME-NAME.jpg", "upload:should-not-reserve")]
+    )
+    assert duplicate[0]["asset_id"] == alias.asset_id
+
+
+def test_pack_rule_crud_and_job_snapshot(settings):
+    rules = PackRuleStore(settings)
+    defaults = rules.list(enabled_only=True)
+    assert {rule.handler for rule in defaults} >= {
+        "group_by_order",
+        "repeat_quantity",
+        "missing_report",
+    }
+    custom = rules.create(
+        name="人工复核说明",
+        description="结果交付前人工复核",
+        handler="note",
+    )
+    changed = rules.update(
+        custom.id,
+        name="人工终检",
+        description=custom.description,
+        handler="note",
+        enabled=True,
+        sort_order=900,
+        config={},
+    )
+    assert changed and changed.name == "人工终检"
+    snapshot = rules.snapshots([custom.id])
+    assert snapshot[0]["handler"] == "note"
+    assert rules.delete(custom.id)
+
+
+def test_eve35_columns_and_selected_pack_rules(settings):
+    xlsx = settings.tmp_dir / "eve35.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["订单号", "SKU", "数量", "地址", "关键词"])
+    ws.append([1001, "HQT10001", 2, "上海*", "front"])
+    wb.save(xlsx)
+    rows = read_excel_rows(xlsx)
+    assert rows[0].order_id == "1001"
+    assert rows[0].quantity == 2
+    assert rows[0].address == "上海*"
+    assert rows[0].keyword == "front"

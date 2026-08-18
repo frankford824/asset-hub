@@ -1,16 +1,39 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from asset_hub.catalog.db import Catalog
 from asset_hub.config import ensure_data_dirs
 from asset_hub.jobs import JobStore
-from asset_hub.pack.excel import match_assets_for_rows, read_excel_rows
+from asset_hub.pack.excel import ExcelRow, match_assets_for_rows, read_excel_rows
 from asset_hub.pack.ziputil import zip_paths
 
 log = logging.getLogger("asset_hub.worker")
+
+
+def _safe_component(value: str, fallback: str) -> str:
+    clean = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", (value or "").strip())
+    return clean.strip(". ") or fallback
+
+
+def _rule_handlers(job) -> set[str]:
+    rules = (job.meta or {}).get("rules") or []
+    if not rules:
+        # Backward-compatible jobs created before rule snapshots existed.
+        return {"prefer_current", "library_fallback", "selection_report", "fast_zip"}
+    return {str(rule.get("handler") or "") for rule in rules if rule.get("handler")}
+
+
+def _group_rows(rows: list[ExcelRow], handlers: set[str]) -> OrderedDict[str, list[ExcelRow]]:
+    groups: OrderedDict[str, list[ExcelRow]] = OrderedDict()
+    for row in rows:
+        key = row.order_id if "group_by_order" in handlers and row.order_id else ""
+        groups.setdefault(key, []).append(row)
+    return groups
 
 
 def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
@@ -19,11 +42,10 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
     if not job:
         return
     job_dir = store.job_dir(job_id)
-    excel_path = None
-    for p in job_dir.iterdir():
-        if p.suffix.lower() in {".xlsx", ".xls"}:
-            excel_path = p
-            break
+    excel_path = next(
+        (path for path in job_dir.iterdir() if path.suffix.lower() in {".xlsx", ".xls"}),
+        None,
+    )
     if not excel_path:
         store.update(
             job_id,
@@ -35,6 +57,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         return
 
     try:
+        handlers = _rule_handlers(job)
         if settings.local_only and not catalog.is_finalized_ready():
             store.update(
                 job_id,
@@ -42,7 +65,11 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             )
         store.update(job_id, progress={"percent": 10, "label": "解析 Excel"})
         rows = read_excel_rows(excel_path)
-        matched, missing = match_assets_for_rows(catalog, rows)
+        matched, missing = match_assets_for_rows(
+            catalog, rows, rule_handlers=handlers
+        )
+        matched_by_row = {block["row"].row_index: block for block in matched}
+        missing_by_row = {item["row"].row_index: item for item in missing}
         preferred_rows = sum(
             block["selection_policy"] == "preferred_current" for block in matched
         )
@@ -64,16 +91,99 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 "fallback_rows": fallback_rows,
             },
         )
+
+        prefix = _safe_component(job.super_dir_name, "pack")
+        generated_dir = job_dir / "generated"
+        generated_dir.mkdir(exist_ok=True)
         pairs: list[tuple[Path, str]] = []
-        prefix = job.super_dir_name.strip() or "pack"
-        for block in matched:
-            row = block["row"]
-            for asset in block["assets"]:
-                src = Path(asset.local_path)
-                if not src.is_file():
+        selection_lines = [
+            "统一素材库选择说明",
+            "本任务采用的规则：" + "、".join(
+                str(rule.get("name"))
+                for rule in ((job.meta or {}).get("rules") or [])
+                if rule.get("name")
+            ),
+            "",
+        ]
+
+        for group_index, (order_id, group_rows) in enumerate(
+            _group_rows(rows, handlers).items(), start=1
+        ):
+            group_missing = [
+                missing_by_row[row.row_index]
+                for row in group_rows
+                if row.row_index in missing_by_row
+            ]
+            group_name = _safe_component(order_id, f"订单_{group_index}") if order_id else ""
+            address = next((row.address for row in group_rows if row.address), "")
+            if group_name and "mark_sensitive" in handlers and "*" in address:
+                group_name += "_【敏感】"
+            if group_name and group_missing and "mark_incomplete" in handlers:
+                group_name += "_未找全"
+            base = f"{prefix}/{group_name}" if group_name else prefix
+
+            if address and "write_address" in handlers:
+                path = generated_dir / f"address-{group_index}.txt"
+                path.write_text(address, encoding="utf-8")
+                pairs.append((path, f"{base}/地址.txt"))
+
+            sku_counters: dict[str, int] = {}
+            for row in group_rows:
+                block = matched_by_row.get(row.row_index)
+                if not block:
+                    item = missing_by_row.get(row.row_index)
+                    if item:
+                        selection_lines.append(
+                            f"第 {row.row_index} 行 · {item['query'] or '未提供检索词'} · {item['reason']}"
+                        )
                     continue
-                arc = f"{prefix}/{row.sku_code or row.sku_name or row.row_index}/{src.name}"
-                pairs.append((src, arc))
+                assets = [asset for asset in block["assets"] if Path(asset.local_path).is_file()]
+                if not assets:
+                    continue
+                sku = _safe_component(row.sku_code or row.sku_name, f"row{row.row_index}")
+                copies = row.quantity if "repeat_quantity" in handlers else 1
+                if len(assets) > 1 and "rename_sku_sequence" in handlers:
+                    for copy_index in range(1, copies + 1):
+                        folder = f"{sku}_row{row.row_index}"
+                        if copies > 1:
+                            folder += f"_{copy_index}"
+                        for asset in assets:
+                            src = Path(asset.local_path)
+                            pairs.append((src, f"{base}/{folder}/{src.name}"))
+                elif "rename_sku_sequence" in handlers:
+                    src = Path(assets[0].local_path)
+                    start = sku_counters.get(sku, 0)
+                    for number in range(start + 1, start + copies + 1):
+                        pairs.append((src, f"{base}/{sku}_{number}{src.suffix.lower()}"))
+                    sku_counters[sku] = start + copies
+                else:
+                    for asset in assets:
+                        src = Path(asset.local_path)
+                        for copy_index in range(1, copies + 1):
+                            suffix = f"_{copy_index}" if copies > 1 else ""
+                            pairs.append(
+                                (src, f"{base}/{sku}/{src.stem}{suffix}{src.suffix}")
+                            )
+                selection_lines.append(
+                    f"第 {row.row_index} 行 · {sku} · {block['selection_label']} · "
+                    f"{len(assets)} 个文件 × {copies}"
+                )
+
+            if group_missing and "missing_report" in handlers:
+                path = generated_dir / f"missing-{group_index}.txt"
+                path.write_text(
+                    "".join(
+                        f"SKU: {item['query']} | {item['reason']}\n"
+                        for item in group_missing
+                    ),
+                    encoding="utf-8",
+                )
+                pairs.append((path, f"{base}/未找到编码.txt"))
+
+        if "selection_report" in handlers:
+            report = generated_dir / "素材选择说明.txt"
+            report.write_text("\n".join(selection_lines) + "\n", encoding="utf-8")
+            pairs.append((report, f"{prefix}/素材选择说明.txt"))
         if not pairs:
             store.update(
                 job_id,
@@ -83,29 +193,10 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 finished=True,
             )
             return
-        report = job_dir / "素材选择说明.txt"
-        report_lines = [
-            "统一素材库选择说明",
-            "规则：同一订单行优先选择当前版本；当前版本不可用时，自动使用库内可用素材。",
-            "",
-        ]
-        for block in matched:
-            row = block["row"]
-            key = row.sku_code or row.sku_name or f"第 {row.row_index} 行"
-            report_lines.append(
-                f"第 {row.row_index} 行 · {key} · {block['selection_label']} · "
-                f"{len(block['assets'])} 个文件"
-            )
-        for item in missing:
-            row = item["row"]
-            report_lines.append(
-                f"第 {row.row_index} 行 · {item['query'] or '未提供检索词'} · 未匹配"
-            )
-        report.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
-        pairs.append((report, f"{prefix}/素材选择说明.txt"))
+
         store.update(job_id, progress={"percent": 60, "label": f"打包 {len(pairs)} 个文件"})
         archive = job_dir / "result.zip"
-        zip_paths(pairs, archive)
+        zip_paths(pairs, archive, fast_media="fast_zip" in handlers)
         store.update(
             job_id,
             status="done",
@@ -113,7 +204,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             progress={
                 "percent": 100,
                 "label": summary,
-                "files": len(pairs) - 1,
+                "files": len(pairs),
                 "matched": len(matched),
                 "missing": len(missing),
                 "preferred_rows": preferred_rows,
@@ -121,13 +212,13 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             },
             finished=True,
         )
-        log.info("job %s done files=%s", job_id, len(pairs))
-    except Exception as e:
+        log.info("job %s done files=%s rules=%s", job_id, len(pairs), sorted(handlers))
+    except Exception as exc:
         log.exception("job failed %s", job_id)
         store.update(
             job_id,
             status="failed",
-            error=str(e),
+            error=str(exc),
             progress={"percent": 0, "label": "failed"},
             finished=True,
         )

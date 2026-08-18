@@ -25,6 +25,8 @@ STORE_EXTS = {
 def zip_paths(
     pairs: list[tuple[Path, str]],
     archive_path: Path,
+    *,
+    fast_media: bool = True,
 ) -> Path:
     """Write zip with STORE for already-compressed types; DEFLATE otherwise."""
     archive_path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,7 +38,11 @@ def zip_paths(
             if not src.is_file():
                 continue
             ext = src.suffix.lower()
-            compress = zipfile.ZIP_STORED if ext in STORE_EXTS else zipfile.ZIP_DEFLATED
+            compress = (
+                zipfile.ZIP_STORED
+                if fast_media and ext in STORE_EXTS
+                else zipfile.ZIP_DEFLATED
+            )
             zf.write(src, arcname, compress_type=compress)
     tmp.replace(archive_path)
     return archive_path

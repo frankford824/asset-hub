@@ -1,531 +1,277 @@
-const $ = (sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
-
-const PAGE_SIZE = 24;
+const $ = (selector, root = document) => root.querySelector(selector);
+const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
 const state = {
-  activeJobId: null,
-  lastDownloadJobId: null,
-  jobs: [],
-  previewZoom: false,
-  previewIndex: -1,
-  pageItems: [],
-  page: 1,
-  total: 0,
-  query: "",
-  searchSeq: 0,
-  overlayMode: null, // busy | done | null
-  debounceTimer: null,
+  rules: [], handlers: [], selectedRules: new Set(), jobs: [],
+  path: "", query: "", offset: 0, hasMore: false,
+  directories: [], files: [], selected: new Set(), focusedId: null,
+  history: [""], historyIndex: 0, treeCache: new Map(), expanded: new Set([""]),
+  batchDownloadUrl: "", previewId: null, searchTimer: null, toastTimer: null,
 };
 
-const STATUS_LABEL = {
-  queued: "排队中",
-  running: "处理中",
-  done: "已完成",
-  failed: "失败",
-};
-
-function fmtBytes(n) {
-  const x = Number(n) || 0;
-  if (x < 1024) return `${x} B`;
-  if (x < 1024 ** 2) return `${(x / 1024).toFixed(1)} KB`;
-  if (x < 1024 ** 3) return `${(x / 1024 ** 2).toFixed(1)} MB`;
-  return `${(x / 1024 ** 3).toFixed(2)} GB`;
+function escapeHtml(value) {
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
-
-function fmtTime(ts) {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
+function fmtBytes(value) {
+  let size = Number(value) || 0;
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
+  return `${index ? size.toFixed(size >= 10 ? 1 : 2) : Math.round(size)} ${units[index]}`;
 }
-
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+function fmtTime(value) {
+  if (!value) return "—";
+  return new Date(Number(value) * 1000).toLocaleString("zh-CN", { hour12: false });
 }
+function isImage(name) { return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name || ""); }
+function previewUrl(id) { return `/api/v1/asset/preview?id=${encodeURIComponent(id)}`; }
+function downloadUrl(id) { return `/api/v1/asset/download?id=${encodeURIComponent(id)}`; }
 
-function humanLabel(raw, status) {
-  const text = String(raw || "").trim();
-  if (!text) return STATUS_LABEL[status] || "处理中";
-  if (/finalized|local_only|sync|OSS|provider|mock|jobs/i.test(text)) {
-    return STATUS_LABEL[status] || "处理中";
+async function api(path, options = {}) {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail; } catch (_) {}
+    const error = new Error(typeof detail === "string" ? detail : detail?.message || JSON.stringify(detail));
+    error.detail = detail; error.status = response.status; throw error;
   }
-  return STATUS_LABEL[text] || text;
+  return (response.headers.get("content-type") || "").includes("application/json")
+    ? response.json() : response;
 }
-
-function assetPreviewUrl(id) {
-  return `/api/v1/asset/preview?id=${encodeURIComponent(id)}`;
+function toast(message) {
+  clearTimeout(state.toastTimer); const el = $("#toast"); el.textContent = message; el.hidden = false;
+  state.toastTimer = setTimeout(() => { el.hidden = true; }, 3200);
 }
-
-function assetDownloadUrl(id) {
-  return `/api/v1/asset/download?id=${encodeURIComponent(id)}`;
+function showMessage(title, body) {
+  $("#message-title").textContent = title;
+  $("#message-body").innerHTML = body;
+  $("#modal-backdrop").hidden = false; $("#message-modal").hidden = false;
 }
-
-function pageCount() {
-  return Math.max(1, Math.ceil((state.total || 0) / PAGE_SIZE));
-}
-
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const j = await res.json();
-      detail = j.detail || JSON.stringify(j);
-    } catch (_) {}
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
-  }
-  const ct = res.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return res.json();
-  return res;
-}
+function closeMessage() { $("#message-modal").hidden = true; if ($("#rule-modal").hidden) $("#modal-backdrop").hidden = true; }
 
 function switchTab(name) {
-  $$(".tab").forEach((t) => {
-    const on = t.dataset.tab === name;
-    t.classList.toggle("active", on);
-    t.setAttribute("aria-selected", on ? "true" : "false");
-  });
-  $("#view-pack").hidden = name !== "pack";
-  $("#view-library").hidden = name !== "library";
-  if (name === "library" && !state.pageItems.length) {
-    loadLibraryPage(1);
-  }
-}
-
-function openDrawer() {
-  $("#drawer-backdrop").hidden = false;
-  $("#jobs-drawer").hidden = false;
-}
-
-function closeDrawer() {
-  $("#drawer-backdrop").hidden = true;
-  $("#jobs-drawer").hidden = true;
-}
-
-function openJobModal(job) {
-  if (!job) return;
-  $("#job-modal-sub").textContent = job.filename || job.id;
-  $("#job-modal-body").innerHTML = `
-    <dl class="kv">
-      <div><dt>状态</dt><dd>${escapeHtml(STATUS_LABEL[job.status] || job.status)}</dd></div>
-      <div><dt>进度</dt><dd>${(job.progress && job.progress.percent) || 0}%</dd></div>
-      <div><dt>说明</dt><dd>${escapeHtml(humanLabel(job.progress && job.progress.label, job.status))}</dd></div>
-      <div><dt>开始</dt><dd>${fmtTime(job.started_at)}</dd></div>
-      <div><dt>完成</dt><dd>${fmtTime(job.finished_at)}</dd></div>
-      <div><dt>编号</dt><dd style="font-family:var(--mono);font-size:12px">${escapeHtml(job.id)}</dd></div>
-    </dl>
-    ${job.error ? `<p class="form-msg err">${escapeHtml(job.error)}</p>` : ""}
-    ${
-      job.has_download
-        ? `<div class="row-actions" style="margin-top:12px"><a class="btn btn-success" href="/api/v1/jobs/${job.id}/download">下载结果</a></div>`
-        : ""
-    }
-  `;
-  $("#job-modal").hidden = false;
-}
-
-function closeJobModal() {
-  $("#job-modal").hidden = true;
-}
-
-/* —— pack overlay —— */
-function showPackBusy(title, sub) {
-  state.overlayMode = "busy";
-  $("#pack-overlay").hidden = false;
-  $("#pack-anim-busy").hidden = false;
-  $("#pack-anim-done").hidden = true;
-  $("#pack-overlay-title").textContent = title || "正在打包";
-  $("#pack-overlay-sub").textContent = sub || "匹配资源并生成压缩包…";
-  $("#pack-overlay-actions").hidden = true;
-  $("#overlay-fill").style.width = "8%";
-}
-
-function updatePackOverlay(job) {
-  if (state.overlayMode !== "busy" && state.overlayMode !== "done") return;
-  if (!job) return;
-  const pct = Math.max(8, (job.progress && job.progress.percent) || 0);
-  $("#overlay-fill").style.width = `${Math.min(100, pct)}%`;
-  $("#pack-overlay-sub").textContent = humanLabel(job.progress && job.progress.label, job.status);
-  if (job.status === "done") {
-    showPackDone(job);
-  } else if (job.status === "failed") {
-    state.overlayMode = "done";
-    $("#pack-anim-busy").hidden = true;
-    $("#pack-anim-done").hidden = true;
-    $("#pack-overlay-title").textContent = "打包失败";
-    $("#pack-overlay-sub").textContent = job.error || "请检查订单表后重试";
-    $("#pack-overlay-actions").hidden = false;
-    $("#overlay-download").hidden = true;
-    $("#overlay-fill").style.width = "100%";
-  }
-}
-
-function showPackDone(job) {
-  state.overlayMode = "done";
-  $("#pack-anim-busy").hidden = true;
-  $("#pack-anim-done").hidden = false;
-  // restart check animation
-  const svg = $(".check-svg", $("#pack-anim-done"));
-  if (svg) {
-    const clone = svg.cloneNode(true);
-    svg.replaceWith(clone);
-  }
-  $("#pack-overlay-title").textContent = "打包完成";
-  $("#pack-overlay-sub").textContent = humanLabel(
-    job.progress && job.progress.label,
-    job.status
-  );
-  $("#overlay-fill").style.width = "100%";
-  $("#pack-overlay-actions").hidden = false;
-  if (job.has_download) {
-    $("#overlay-download").hidden = false;
-    $("#overlay-download").href = `/api/v1/jobs/${job.id}/download`;
-    if ($("#auto-download").checked && state.lastDownloadJobId !== job.id) {
-      state.lastDownloadJobId = job.id;
-      const a = document.createElement("a");
-      a.href = $("#overlay-download").href;
-      a.click();
-    }
-  } else {
-    $("#overlay-download").hidden = true;
-  }
-}
-
-function closePackOverlay() {
-  state.overlayMode = null;
-  $("#pack-overlay").hidden = true;
-}
-
-/* —— preview lightbox with page nav —— */
-function openPreviewAt(index) {
-  const items = state.pageItems.filter((x) => x.previewable || isImageName(x.file_name));
-  if (!items.length) return;
-  state.previewIndex = Math.max(0, Math.min(index, items.length - 1));
-  const asset = items[state.previewIndex];
-  state.previewZoom = false;
-  const img = $("#preview-img");
-  img.hidden = true;
-  img.classList.remove("zoomed");
-  $("#preview-loading").hidden = false;
-  $("#preview-title").textContent = asset.file_name || "预览";
-  $("#preview-sub").textContent = `${state.previewIndex + 1}/${items.length} · ${asset.sku_code || "—"} · ${fmtBytes(asset.file_size)}`;
-  $("#preview-download").href = assetDownloadUrl(asset.asset_id);
-  $("#preview-modal").hidden = false;
-  img.onload = () => {
-    $("#preview-loading").hidden = true;
-    img.hidden = false;
-  };
-  img.onerror = () => {
-    $("#preview-loading").hidden = true;
-    img.hidden = true;
-    $("#preview-sub").textContent = "预览加载失败，可直接下载";
-  };
-  img.src = assetPreviewUrl(asset.asset_id);
-}
-
-function previewStep(delta) {
-  const items = state.pageItems.filter((x) => x.previewable || isImageName(x.file_name));
-  if (!items.length) return;
-  const next = (state.previewIndex + delta + items.length) % items.length;
-  openPreviewAt(next);
-}
-
-function closePreview() {
-  $("#preview-modal").hidden = true;
-  $("#preview-img").removeAttribute("src");
-}
-
-function isImageName(name) {
-  return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name || "");
-}
-
-/* —— progress / jobs —— */
-function renderProgress(job) {
-  const steps = $$(".steps span");
-  steps.forEach((el) => el.classList.remove("on", "done"));
-  if (!job) {
-    $("#progress-label").textContent = "暂无进行中的任务";
-    $("#progress-pct").textContent = "—";
-    $("#progress-fill").style.width = "0%";
-    $("#meta-filename").textContent = "—";
-    $("#meta-started").textContent = "—";
-    $("#meta-finished").textContent = "—";
-    $("#progress-actions").hidden = true;
-    return;
-  }
-  const pct = (job.progress && job.progress.percent) || 0;
-  $("#progress-pct").textContent = `${pct}%`;
-  $("#progress-fill").style.width = `${Math.max(0, Math.min(100, pct))}%`;
-  $("#progress-label").textContent = humanLabel(job.progress && job.progress.label, job.status);
-  $("#meta-filename").textContent = job.filename || "—";
-  $("#meta-started").textContent = fmtTime(job.started_at);
-  $("#meta-finished").textContent = fmtTime(job.finished_at);
-  if (job.status === "queued") steps[0].classList.add("on");
-  else if (job.status === "running") {
-    steps[0].classList.add("done");
-    steps[1].classList.add("on");
-  } else if (job.status === "done") steps.forEach((s) => s.classList.add("done"));
-  else if (job.status === "failed") steps[1].classList.add("on");
-
-  const canDl = job.has_download && job.status === "done";
-  $("#progress-actions").hidden = !(canDl || job.status === "failed" || job.status === "done");
-  $("#progress-download").hidden = !canDl;
-  if (canDl) $("#progress-download").href = `/api/v1/jobs/${job.id}/download`;
-
-  if (state.overlayMode === "busy" || state.overlayMode === "done") {
-    updatePackOverlay(job);
-  }
-}
-
-function renderJobs(jobs) {
-  state.jobs = jobs;
-  const preview = $("#jobs-preview");
-  const list = $("#jobs-list");
-  if (!jobs.length) {
-    preview.innerHTML = `<div class="empty">暂无记录</div>`;
-    list.innerHTML = `<div class="empty">暂无记录</div>`;
-    if (!state.activeJobId) renderProgress(null);
-    return;
-  }
-  if (!state.activeJobId) state.activeJobId = jobs[0].id;
-  const active = jobs.find((j) => j.id === state.activeJobId) || jobs[0];
-  renderProgress(active);
-
-  const rowHtml = (j) => {
-    const st = STATUS_LABEL[j.status] || j.status;
-    const pct = (j.progress && j.progress.percent) || 0;
-    return `<div class="job-row" data-job="${j.id}">
-      <div>
-        <strong>${escapeHtml(j.filename || j.id.slice(0, 8))}</strong>
-        <span>${escapeHtml(st)} · ${pct}%</span>
-      </div>
-      ${
-        j.has_download
-          ? `<a class="btn btn-success btn-sm" href="/api/v1/jobs/${j.id}/download" onclick="event.stopPropagation()">下载</a>`
-          : `<button class="btn btn-ghost btn-sm" type="button">详情</button>`
-      }
-    </div>`;
-  };
-  preview.innerHTML = jobs.slice(0, 4).map(rowHtml).join("");
-  list.innerHTML = jobs.map(rowHtml).join("");
-  [...$$(".job-row", preview), ...$$(".job-row", list)].forEach((el) => {
-    el.addEventListener("click", () => {
-      state.activeJobId = el.dataset.job;
-      const job = state.jobs.find((j) => j.id === state.activeJobId);
-      renderProgress(job);
-      openJobModal(job);
-    });
-  });
+  $$(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
+  $("#view-pack").hidden = name !== "pack"; $("#view-library").hidden = name !== "library";
+  if (name === "library" && !state.treeCache.size) loadLibrary("").catch(showError);
 }
 
 async function refreshStatus() {
-  const s = await api("/api/v1/status");
-  const total = s.asset_count || 0;
-  $("#meta-count").textContent = `素材 ${total.toLocaleString()}`;
-  const ready = s.ready_for_pack || total > 0;
-  const chip = $("#meta-ready");
-  chip.textContent = ready ? (s.sync_complete ? "已就绪" : "同步中，可用") : "准备中";
-  chip.className = `meta-chip ${ready ? "ok" : "warn"}`;
+  const status = await api("/api/v1/status");
+  $("#meta-count").textContent = `素材 ${(status.asset_count || 0).toLocaleString()}`;
+  const ready = status.ready_for_pack || status.asset_count > 0;
+  const chip = $("#meta-ready"); chip.textContent = ready ? (status.sync_complete ? "已就绪" : "同步中，可用") : "准备中";
+  chip.className = `status-dot ${ready ? "ok" : "warn"}`;
 }
 
-async function refreshJobs() {
-  const data = await api("/api/v1/jobs?limit=30");
-  renderJobs(data.jobs || []);
-  const active = (data.jobs || []).find((j) => j.id === state.activeJobId);
-  if (active && (active.status === "running" || active.status === "queued")) {
-    try {
-      const detail = await api(`/api/v1/jobs/${active.id}`);
-      renderProgress(detail);
-    } catch (_) {}
-  }
+/* rules */
+async function loadRules({ preserve = false } = {}) {
+  const data = await api("/api/v1/pack-rules");
+  const before = new Set(state.selectedRules); state.rules = data.rules || []; state.handlers = data.handlers || [];
+  state.selectedRules = new Set(
+    state.rules.filter((rule) => rule.enabled && (!preserve || before.has(rule.id))).map((rule) => rule.id)
+  );
+  if (preserve && before.size === 0) state.selectedRules.clear();
+  renderRules();
 }
-
-/* —— library waterfall + live search + pager —— */
-function renderPager() {
-  const pages = pageCount();
-  const show = state.total > 0;
-  $("#pager").hidden = !show;
-  $("#page-info").textContent = `${state.page} / ${pages}`;
-  $("#page-prev").disabled = state.page <= 1;
-  $("#page-next").disabled = state.page >= pages;
-  $("#lib-total").textContent = state.total
-    ? `共 ${state.total.toLocaleString()} 项`
-    : "无结果";
-}
-
-function renderWaterfall(rows) {
-  const box = $("#results");
-  state.pageItems = rows;
-  if (!rows.length) {
-    box.innerHTML = `<div class="empty wide">没有找到匹配素材</div>`;
-    return;
-  }
-  box.innerHTML = rows
-    .map((r, idx) => {
-      const previewable = r.previewable || isImageName(r.file_name);
-      const thumb = previewable
-        ? `<img src="${assetPreviewUrl(r.asset_id)}" alt="" loading="lazy" />`
-        : `<div class="ph">${escapeHtml((r.file_name || "").split(".").pop() || "FILE").toUpperCase()}</div>`;
-      return `<article class="asset-card" data-idx="${idx}" data-id="${encodeURIComponent(r.asset_id)}" data-previewable="${previewable ? "1" : "0"}">
-        <div class="thumb">${thumb}</div>
-        <div class="asset-info">
-          <strong title="${escapeHtml(r.file_name || "")}">${escapeHtml(r.file_name || r.asset_id)}</strong>
-          <em>${escapeHtml(r.sku_code || "—")} · ${fmtBytes(r.file_size)}</em>
-        </div>
-      </article>`;
-    })
-    .join("");
-
-  $$(".asset-card", box).forEach((card) => {
-    card.addEventListener("click", () => {
-      const idx = Number(card.dataset.idx);
-      const asset = state.pageItems[idx];
-      if (!asset) return;
-      if (card.dataset.previewable === "1") {
-        const previewables = state.pageItems.filter(
-          (x) => x.previewable || isImageName(x.file_name)
-        );
-        const pidx = previewables.findIndex((x) => x.asset_id === asset.asset_id);
-        openPreviewAt(pidx >= 0 ? pidx : 0);
-      } else {
-        window.location.href = assetDownloadUrl(asset.asset_id);
-      }
+function renderRules() {
+  const list = $("#rules-list");
+  if (!state.rules.length) { list.innerHTML = '<div class="empty">暂无规则，可点击“添加规则”创建。</div>'; }
+  else list.innerHTML = state.rules.map((rule) => `
+    <div class="rule-row ${rule.enabled ? "" : "disabled"}" data-rule="${escapeHtml(rule.id)}">
+      <input class="rule-check" type="checkbox" ${state.selectedRules.has(rule.id) ? "checked" : ""} ${rule.enabled ? "" : "disabled"} aria-label="选择 ${escapeHtml(rule.name)}" />
+      <div class="rule-copy"><strong>${escapeHtml(rule.name)}</strong><p>${escapeHtml(rule.description)}</p></div>
+      <div class="rule-actions"><button class="edit-rule" type="button">编辑</button><button class="delete delete-rule" type="button">删除</button></div>
+    </div>`).join("");
+  $$(".rule-row", list).forEach((row) => {
+    const id = row.dataset.rule;
+    $(".rule-check", row)?.addEventListener("change", (event) => {
+      event.target.checked ? state.selectedRules.add(id) : state.selectedRules.delete(id); updateRuleCount();
+    });
+    $(".edit-rule", row)?.addEventListener("click", () => openRuleModal(state.rules.find((rule) => rule.id === id)));
+    $(".delete-rule", row)?.addEventListener("click", async () => {
+      const rule = state.rules.find((item) => item.id === id);
+      if (!confirm(`确定删除规则“${rule?.name || id}”吗？已创建任务中的规则快照不受影响。`)) return;
+      await api(`/api/v1/pack-rules/${encodeURIComponent(id)}`, { method: "DELETE" });
+      state.selectedRules.delete(id); await loadRules({ preserve: true }); toast("规则已删除");
     });
   });
+  updateRuleCount();
+}
+function updateRuleCount() { $("#selected-rule-count").textContent = String(state.selectedRules.size); }
+function openRuleModal(rule = null) {
+  $("#rule-modal-title").textContent = rule ? "编辑规则" : "添加规则";
+  $("#rule-id").value = rule?.id || ""; $("#rule-name").value = rule?.name || "";
+  $("#rule-description").value = rule?.description || ""; $("#rule-enabled").checked = rule?.enabled ?? true;
+  $("#rule-handler").innerHTML = state.handlers.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join("");
+  $("#rule-handler").value = rule?.handler || state.handlers[0]?.value || "note";
+  $("#modal-backdrop").hidden = false; $("#rule-modal").hidden = false;
+}
+function closeRuleModal() { $("#rule-modal").hidden = true; if ($("#message-modal").hidden) $("#modal-backdrop").hidden = true; }
+async function submitRule(event) {
+  event.preventDefault(); const id = $("#rule-id").value;
+  const payload = { name: $("#rule-name").value.trim(), description: $("#rule-description").value.trim(), handler: $("#rule-handler").value, enabled: $("#rule-enabled").checked, sort_order: id ? state.rules.find((rule) => rule.id === id)?.sort_order || 1000 : 1000, config: {} };
+  await api(id ? `/api/v1/pack-rules/${encodeURIComponent(id)}` : "/api/v1/pack-rules", { method: id ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  closeRuleModal(); await loadRules({ preserve: true }); toast(id ? "规则已更新" : "规则已添加");
 }
 
-async function loadLibraryPage(page, { quiet } = {}) {
-  const seq = ++state.searchSeq;
-  state.page = Math.max(1, page);
-  const offset = (state.page - 1) * PAGE_SIZE;
-  if (!quiet) {
-    $("#lib-loading").hidden = false;
-    $("#search-spin").hidden = false;
-  } else {
-    $("#search-spin").hidden = false;
-  }
-  try {
-    const params = new URLSearchParams({
-      q: state.query,
-      limit: String(PAGE_SIZE),
-      offset: String(offset),
+/* jobs */
+async function loadJobs() { const data = await api("/api/v1/jobs?limit=20"); state.jobs = data.jobs || []; renderJobs(); }
+function renderJobs() {
+  const box = $("#jobs-list");
+  if (!state.jobs.length) { box.innerHTML = '<div class="empty">暂无任务</div>'; return; }
+  box.innerHTML = state.jobs.map((job) => {
+    const percent = Number(job.progress?.percent) || 0;
+    const label = { queued: "排队中", running: "处理中", done: "已完成", failed: "失败" }[job.status] || job.status;
+    return `<div class="job-row"><div><strong>${escapeHtml(job.filename || job.id)}</strong><small>${escapeHtml(label)} · ${escapeHtml(job.progress?.label || "")}</small></div><div class="job-progress"><i style="width:${Math.max(0, Math.min(100, percent))}%"></i></div><div>${job.has_download ? `<a class="btn secondary" href="/api/v1/jobs/${job.id}/download">下载</a>` : `<small>${percent}%</small>`}</div></div>`;
+  }).join("");
+}
+async function submitPack(event) {
+  event.preventDefault(); const file = $("#excel").files[0]; if (!file) return;
+  const form = new FormData(); form.append("file", file); form.append("super_dir_name", $("#super").value.trim()); form.append("rule_ids", JSON.stringify([...state.selectedRules]));
+  $("#pack-submit").disabled = true; $("#pack-submit").textContent = "正在提交…"; $("#pack-msg").hidden = true;
+  try { await api("/api/v1/jobs", { method: "POST", body: form }); $("#excel").value = ""; $("#excel-label").textContent = "拖入订单 Excel，或点击选择"; await loadJobs(); toast("打包任务已提交"); }
+  catch (error) { $("#pack-msg").hidden = false; $("#pack-msg").className = "form-message err"; $("#pack-msg").textContent = error.message; }
+  finally { $("#pack-submit").disabled = false; $("#pack-submit").textContent = "提交打包"; }
+}
+
+/* virtual directory tree */
+async function fetchTree(path, limit = 200, offset = 0) {
+  const params = new URLSearchParams({ path, q: state.query, limit: String(limit), offset: String(offset) });
+  return api(`/api/v1/library/tree?${params}`);
+}
+async function ensureTreePath(path) {
+  const parts = path ? path.split("/") : []; let current = ""; state.expanded.add("");
+  if (!state.treeCache.has("")) { const root = await fetchTree("", 1); state.treeCache.set("", root.directories || []); }
+  for (const part of parts) { current = current ? `${current}/${part}` : part; state.expanded.add(current); if (!state.treeCache.has(current)) { const data = await fetchTree(current, 1); state.treeCache.set(current, data.directories || []); } }
+}
+function renderTree() {
+  const renderNode = (name, path, depth) => {
+    const expanded = state.expanded.has(path); const children = state.treeCache.get(path) || [];
+    return `<div><div class="tree-row ${state.path === path ? "active" : ""}" data-tree-path="${escapeHtml(path)}" style="padding-left:${7 + depth * 4}px"><span class="twisty">${children.length ? (expanded ? "▾" : "▸") : ""}</span><span class="folder-icon">▰</span><span>${escapeHtml(name)}</span></div>${expanded && children.length ? `<div class="tree-children">${children.map((child) => renderNode(child.name, child.path, depth + 1)).join("")}</div>` : ""}</div>`;
+  };
+  $("#directory-tree").innerHTML = renderNode("素材库", "", 0);
+  $$(".tree-row").forEach((row) => row.addEventListener("click", async (event) => {
+    const path = row.dataset.treePath; const clickedTwisty = event.target.classList.contains("twisty");
+    if (clickedTwisty) { if (state.expanded.has(path)) state.expanded.delete(path); else { state.expanded.add(path); if (!state.treeCache.has(path)) { const data = await fetchTree(path, 1); state.treeCache.set(path, data.directories || []); } } renderTree(); }
+    else navigate(path);
+  }));
+}
+async function loadLibrary(path, { append = false, pushHistory = false } = {}) {
+  const clean = path.replace(/^\/+|\/+$/g, "");
+  const offset = append ? state.files.length : 0; state.path = clean;
+  if (!append) { state.offset = 0; state.selected.clear(); state.focusedId = null; state.batchDownloadUrl = ""; }
+  const data = await fetchTree(clean, 200, offset);
+  state.directories = data.directories || []; state.files = append ? [...state.files, ...(data.files || [])] : (data.files || []);
+  state.hasMore = Boolean(data.has_more); state.treeCache.set(clean, state.directories);
+  await ensureTreePath(clean); if (pushHistory && state.history[state.historyIndex] !== clean) { state.history = state.history.slice(0, state.historyIndex + 1); state.history.push(clean); state.historyIndex += 1; }
+  renderBreadcrumbs(data.breadcrumbs || []); renderTree(); renderLibrary(); updateSelection();
+}
+function navigate(path) { loadLibrary(path, { pushHistory: true }).catch(showError); }
+function renderBreadcrumbs(items) { $("#breadcrumbs").innerHTML = items.map((item) => `<button type="button" data-path="${escapeHtml(item.path)}">${escapeHtml(item.name)}</button>`).join(""); $$("button", $("#breadcrumbs")).forEach((button) => button.addEventListener("click", () => navigate(button.dataset.path))); }
+function renderLibrary() {
+  $("#folder-title").textContent = state.path.split("/").pop() || "素材库";
+  $("#folder-count").textContent = `${state.directories.length} 个目录 · ${state.files.length}${state.hasMore ? "+" : ""} 个文件`;
+  $("#folder-grid").innerHTML = state.directories.map((folder) => `<div class="folder-tile" data-path="${escapeHtml(folder.path)}"><span class="folder-art">▰</span><span><strong title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</strong><small>${folder.file_count || 0} 个文件</small></span></div>`).join("");
+  $$(".folder-tile").forEach((tile) => { tile.addEventListener("dblclick", () => navigate(tile.dataset.path)); tile.addEventListener("click", () => { $$(".folder-tile").forEach((item) => item.classList.remove("selected")); tile.classList.add("selected"); }); });
+  $("#file-grid").innerHTML = state.files.map((file) => {
+    const preview = file.previewable || isImage(file.file_name); const ext = (file.file_name.split(".").pop() || "FILE").slice(0, 5).toUpperCase();
+    return `<article class="file-tile ${state.selected.has(file.asset_id) ? "selected" : ""}" draggable="true" data-id="${escapeHtml(file.asset_id)}"><span class="file-check">✓</span><div class="file-thumb">${preview ? `<img src="${previewUrl(file.asset_id)}" alt="" loading="lazy" />` : `<span class="file-icon">${escapeHtml(ext)}</span>`}</div><div class="file-label"><strong title="${escapeHtml(file.file_name)}">${escapeHtml(file.file_name)}</strong><small>${fmtBytes(file.file_size)}</small></div></article>`;
+  }).join("");
+  bindFileTiles(); $("#load-more").hidden = !state.hasMore; $("#library-empty").hidden = Boolean(state.directories.length || state.files.length);
+}
+function bindFileTiles() {
+  $$(".file-tile").forEach((tile) => {
+    tile.addEventListener("click", (event) => selectFile(tile.dataset.id, event.ctrlKey || event.metaKey || event.shiftKey));
+    tile.addEventListener("dblclick", () => { const file = state.files.find((item) => item.asset_id === tile.dataset.id); if (file?.previewable || isImage(file?.file_name)) openPreview(file.asset_id); else window.location.href = downloadUrl(file.asset_id); });
+    tile.addEventListener("dragstart", (event) => startDownloadDrag(event, tile.dataset.id));
+  });
+}
+function selectFile(id, additive = false) { if (!additive) state.selected.clear(); if (additive && state.selected.has(id)) state.selected.delete(id); else state.selected.add(id); state.focusedId = id; renderLibrary(); updateSelection(); }
+function focusedFile() { return state.files.find((file) => file.asset_id === state.focusedId) || state.files.find((file) => state.selected.has(file.asset_id)); }
+function updateSelection() {
+  const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count; $("#download-selected").disabled = !count;
+  const file = focusedFile(); $("#detail-empty").hidden = Boolean(file); $("#file-detail").hidden = !file;
+  $(".detail-pane").classList.toggle("open", Boolean(file));
+  if (file) renderDetail(file); prepareBatchTicket();
+}
+function renderDetail(file) {
+  const previewable = file.previewable || isImage(file.file_name); const image = $("#detail-image"); image.hidden = !previewable; $("#detail-placeholder").hidden = previewable;
+  if (previewable) image.src = previewUrl(file.asset_id); else $("#detail-placeholder").textContent = (file.file_name.split(".").pop() || "FILE").toUpperCase();
+  $("#detail-name").textContent = file.file_name; $("#detail-size").textContent = fmtBytes(file.file_size); $("#detail-time").textContent = fmtTime(file.updated_at); $("#detail-path").textContent = `/${file.virtual_path || file.file_name}`; $("#detail-sku").textContent = file.sku_code || "—"; $("#detail-dedup").textContent = file.deduplicated ? "已按文件名复用" : "唯一文件名"; $("#open-large-preview").hidden = !previewable; $("#single-download").href = downloadUrl(file.asset_id);
+}
+async function prepareBatchTicket() { const ids = [...state.selected]; state.batchDownloadUrl = ""; if (ids.length < 2) return; try { const data = await api("/api/v1/assets/download-ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) }); if (ids.every((id) => state.selected.has(id)) && ids.length === state.selected.size) state.batchDownloadUrl = new URL(data.download_url, location.href).href; } catch (_) {} }
+function startDownloadDrag(event, id) { if (!state.selected.has(id)) { state.selected = new Set([id]); state.focusedId = id; updateSelection(); } const ids = [...state.selected]; const file = state.files.find((item) => item.asset_id === id); const url = ids.length > 1 ? state.batchDownloadUrl : new URL(downloadUrl(id), location.href).href; if (!url) { event.preventDefault(); toast("批量下载正在准备，请稍后再拖一次"); return; } const name = ids.length > 1 ? `素材下载_${ids.length}项.zip` : file.file_name; event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("DownloadURL", `application/octet-stream:${name}:${url}`); event.dataTransfer.setData("text/uri-list", url); }
+async function downloadSelected() {
+  const ids = [...state.selected]; if (!ids.length) return;
+  let url = ids.length === 1 ? downloadUrl(ids[0]) : state.batchDownloadUrl;
+  if (ids.length > 1 && !url) {
+    const ticket = await api("/api/v1/assets/download-ticket", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }),
     });
-    const data = await api(`/api/v1/search?${params}`);
-    if (seq !== state.searchSeq) return;
-    state.total = data.total || 0;
-    const maxPage = pageCount();
-    if (state.page > maxPage) {
-      return loadLibraryPage(maxPage, { quiet });
-    }
-    renderWaterfall(data.results || []);
-    renderPager();
-  } catch (e) {
-    if (seq !== state.searchSeq) return;
-    $("#results").innerHTML = `<div class="empty wide">${escapeHtml(e.message || String(e))}</div>`;
-    $("#pager").hidden = true;
-  } finally {
-    if (seq === state.searchSeq) {
-      $("#lib-loading").hidden = true;
-      $("#search-spin").hidden = true;
-    }
+    url = ticket.download_url;
   }
+  const anchor = document.createElement("a"); anchor.href = url;
+  anchor.download = ids.length > 1 ? "素材下载.zip" : focusedFile()?.file_name || "素材下载";
+  document.body.appendChild(anchor); anchor.click(); anchor.remove();
 }
 
-function scheduleLiveSearch() {
-  clearTimeout(state.debounceTimer);
-  state.debounceTimer = setTimeout(() => {
-    state.query = $("#q").value.trim();
-    loadLibraryPage(1, { quiet: true });
-  }, 280);
+/* rectangle select */
+let dragSelect = null;
+function beginRectangle(event) { if (event.button !== 0 || event.target.closest(".file-tile,.folder-tile,button,a")) return; const canvas = $("#file-canvas"); dragSelect = { x: event.clientX, y: event.clientY, additive: event.ctrlKey || event.metaKey, original: new Set(state.selected) }; $("#selection-box").hidden = false; canvas.setPointerCapture?.(event.pointerId); event.preventDefault(); }
+function moveRectangle(event) { if (!dragSelect) return; const left = Math.min(dragSelect.x, event.clientX), top = Math.min(dragSelect.y, event.clientY), right = Math.max(dragSelect.x, event.clientX), bottom = Math.max(dragSelect.y, event.clientY); const box = $("#selection-box"); Object.assign(box.style, { left: `${left}px`, top: `${top}px`, width: `${right-left}px`, height: `${bottom-top}px` }); const selected = dragSelect.additive ? new Set(dragSelect.original) : new Set(); $$(".file-tile").forEach((tile) => { const rect = tile.getBoundingClientRect(); if (rect.right >= left && rect.left <= right && rect.bottom >= top && rect.top <= bottom) selected.add(tile.dataset.id); }); state.selected = selected; $$(".file-tile").forEach((tile) => tile.classList.toggle("selected", state.selected.has(tile.dataset.id))); $("#selection-count").textContent = state.selected.size ? `已选择 ${state.selected.size} 项` : "未选择"; }
+function endRectangle() { if (!dragSelect) return; dragSelect = null; $("#selection-box").hidden = true; state.focusedId = [...state.selected].at(-1) || null; updateSelection(); }
+
+/* upload */
+async function entriesFromDrop(dataTransfer) {
+  const results = [];
+  async function walk(entry, prefix = "") {
+    if (results.length >= 200) return;
+    if (entry.isFile) await new Promise((resolve) => entry.file((file) => { results.push({ file, relative: `${prefix}${file.name}` }); resolve(); }, resolve));
+    else if (entry.isDirectory) { const reader = entry.createReader(); let batch; do { batch = await new Promise((resolve) => reader.readEntries(resolve)); for (const child of batch) await walk(child, `${prefix}${entry.name}/`); } while (batch.length); }
+  }
+  const items = [...(dataTransfer.items || [])];
+  if (items.some((item) => item.webkitGetAsEntry)) { for (const item of items) { const entry = item.webkitGetAsEntry?.(); if (entry) await walk(entry); } }
+  else [...dataTransfer.files].forEach((file) => results.push({ file, relative: file.name }));
+  return results;
+}
+async function uploadItems(items) {
+  if (!items.length) return; $("#upload-banner").hidden = false; $("#upload-banner").textContent = `正在添加 ${items.length} 个文件…`;
+  const form = new FormData(); items.forEach((item) => form.append("files", item.file, item.file.name)); form.append("target_path", state.path); form.append("relative_paths", JSON.stringify(items.map((item) => item.relative || item.file.name)));
+  try { const result = await api("/api/v1/library/upload", { method: "POST", body: form }); toast(`已添加 ${result.added} 个资源`); await loadLibrary(state.path); await refreshStatus(); }
+  catch (error) { if (error.status === 409 && error.detail?.duplicates) { showMessage("文件名重复", `<p>以下文件名已存在，整批未添加：</p><ul>${error.detail.duplicates.map((item) => `<li>${escapeHtml(item.file_name)}</li>`).join("")}</ul><p>请重命名后再次拖入。</p>`); } else showError(error); }
+  finally { $("#upload-banner").hidden = true; }
 }
 
-async function submitPack(ev) {
-  ev.preventDefault();
-  const msg = $("#pack-msg");
-  const file = $("#excel").files[0];
-  if (!file) return;
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("super_dir_name", $("#super").value.trim());
-  msg.hidden = true;
-  $("#pack-submit").disabled = true;
-  showPackBusy("正在提交", "上传订单表…");
-  try {
-    const data = await api("/api/v1/jobs", { method: "POST", body: fd });
-    state.activeJobId = data.job_id;
-    state.lastDownloadJobId = null;
-    showPackBusy("正在打包", "匹配资源并生成压缩包…");
-    $("#excel").value = "";
-    await refreshJobs();
-  } catch (e) {
-    closePackOverlay();
-    msg.hidden = false;
-    msg.className = "form-msg err";
-    msg.textContent = String(e.message || e);
-  } finally {
-    $("#pack-submit").disabled = false;
-  }
-}
+/* preview */
+function previewFiles() { return state.files.filter((file) => file.previewable || isImage(file.file_name)); }
+function openPreview(id) { const files = previewFiles(), file = files.find((item) => item.asset_id === id); if (!file) return; state.previewId = id; $("#preview-title").textContent = file.file_name; $("#preview-sub").textContent = `${fmtBytes(file.file_size)} · /${file.virtual_path}`; $("#preview-image").src = previewUrl(id); $("#preview-image").classList.remove("zoomed"); $("#preview-modal").hidden = false; }
+function previewStep(delta) { const files = previewFiles(); if (!files.length) return; let index = files.findIndex((item) => item.asset_id === state.previewId); index = (index + delta + files.length) % files.length; openPreview(files[index].asset_id); }
+function closePreview() { $("#preview-modal").hidden = true; $("#preview-image").removeAttribute("src"); }
 
-// events
-$$(".tab").forEach((t) => t.addEventListener("click", () => switchTab(t.dataset.tab)));
-$("#pack-form").addEventListener("submit", submitPack);
-$("#q").addEventListener("input", scheduleLiveSearch);
-$("#page-prev").addEventListener("click", () => loadLibraryPage(state.page - 1));
-$("#page-next").addEventListener("click", () => loadLibraryPage(state.page + 1));
-$("#btn-refresh-meta").addEventListener("click", () => {
-  refreshStatus().catch(console.error);
-  refreshJobs().catch(console.error);
-  if (!$("#view-library").hidden) loadLibraryPage(state.page);
-});
-$("#btn-open-jobs").addEventListener("click", openDrawer);
-$("#btn-job-detail").addEventListener("click", () => {
-  openJobModal(state.jobs.find((j) => j.id === state.activeJobId));
-});
-$("#drawer-backdrop").addEventListener("click", closeDrawer);
-$$('[data-close="drawer"]').forEach((b) => b.addEventListener("click", closeDrawer));
-$$('[data-close="job-modal"]').forEach((b) => b.addEventListener("click", closeJobModal));
-$$('[data-close="preview-modal"]').forEach((b) => b.addEventListener("click", closePreview));
-$("#job-modal").addEventListener("click", (e) => {
-  if (e.target === $("#job-modal")) closeJobModal();
-});
-$("#preview-modal").addEventListener("click", (e) => {
-  if (e.target === $("#preview-modal")) closePreview();
-});
-$("#preview-img").addEventListener("click", () => {
-  state.previewZoom = !state.previewZoom;
-  $("#preview-img").classList.toggle("zoomed", state.previewZoom);
-});
-$("#preview-prev").addEventListener("click", () => previewStep(-1));
-$("#preview-next").addEventListener("click", () => previewStep(1));
-$("#overlay-close").addEventListener("click", closePackOverlay);
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") {
-    closePreview();
-    closeJobModal();
-    closeDrawer();
-    if (state.overlayMode === "done") closePackOverlay();
-  }
-  if (!$("#preview-modal").hidden) {
-    if (e.key === "ArrowLeft") previewStep(-1);
-    if (e.key === "ArrowRight") previewStep(1);
-  }
-});
+function showError(error) { console.error(error); showMessage("操作失败", `<p>${escapeHtml(error?.message || String(error))}</p>`); }
+
+/* events */
+$$(".tab").forEach((tab) => tab.addEventListener("click", () => switchTab(tab.dataset.tab)));
+$("#btn-refresh").addEventListener("click", () => Promise.all([refreshStatus(), loadJobs(), loadRules({ preserve: true }), !$("#view-library").hidden ? loadLibrary(state.path) : Promise.resolve()]).catch(showError));
+$("#add-rule").addEventListener("click", () => openRuleModal()); $("#rule-form").addEventListener("submit", (event) => submitRule(event).catch(showError)); $$('[data-close-modal]').forEach((button) => button.addEventListener("click", closeRuleModal)); $$('[data-close-message]').forEach((button) => button.addEventListener("click", closeMessage));
+$("#select-all-rules").addEventListener("click", () => { const enabled = state.rules.filter((rule) => rule.enabled); const all = enabled.every((rule) => state.selectedRules.has(rule.id)); state.selectedRules = new Set(all ? [] : enabled.map((rule) => rule.id)); renderRules(); });
+$("#pack-form").addEventListener("submit", submitPack); $("#refresh-jobs").addEventListener("click", () => loadJobs().catch(showError));
+$("#excel").addEventListener("change", (event) => { $("#excel-label").textContent = event.target.files[0]?.name || "拖入订单 Excel，或点击选择"; });
+const excelDrop = $("#excel-drop"); ["dragenter", "dragover"].forEach((name) => excelDrop.addEventListener(name, (event) => { event.preventDefault(); excelDrop.classList.add("dragging"); })); ["dragleave", "drop"].forEach((name) => excelDrop.addEventListener(name, () => excelDrop.classList.remove("dragging")));
+$("#nav-home").addEventListener("click", () => navigate("")); $("#nav-up").addEventListener("click", () => navigate(state.path.split("/").slice(0,-1).join("/"))); $("#nav-back").addEventListener("click", () => { if (state.historyIndex <= 0) return; state.historyIndex -= 1; loadLibrary(state.history[state.historyIndex]).catch(showError); });
+$("#library-search").addEventListener("input", (event) => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => { state.query = event.target.value.trim(); loadLibrary(state.path).catch(showError); }, 250); });
+$("#upload-files").addEventListener("click", () => $("#file-picker").click()); $("#upload-folder").addEventListener("click", () => $("#folder-picker").click());
+$("#file-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.name }))).finally(() => { event.target.value = ""; })); $("#folder-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.webkitRelativePath || file.name }))).finally(() => { event.target.value = ""; }));
+const canvas = $("#file-canvas"); canvas.addEventListener("pointerdown", beginRectangle); canvas.addEventListener("pointermove", moveRectangle); canvas.addEventListener("pointerup", endRectangle); canvas.addEventListener("pointercancel", endRectangle);
+let dragDepth = 0; canvas.addEventListener("dragenter", (event) => { if ([...event.dataTransfer.types].includes("Files")) { event.preventDefault(); dragDepth += 1; $("#drop-zone").hidden = false; } }); canvas.addEventListener("dragover", (event) => { if ([...event.dataTransfer.types].includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }); canvas.addEventListener("dragleave", () => { dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; $("#drop-zone").hidden = true; } }); canvas.addEventListener("drop", async (event) => { event.preventDefault(); dragDepth = 0; $("#drop-zone").hidden = true; uploadItems(await entriesFromDrop(event.dataTransfer)); });
+$("#download-selected").addEventListener("click", () => downloadSelected().catch(showError)); $("#clear-selection").addEventListener("click", () => { state.selected.clear(); state.focusedId = null; renderLibrary(); updateSelection(); }); $("#load-more").addEventListener("click", () => loadLibrary(state.path, { append: true }).catch(showError));
+$("#detail-preview").addEventListener("click", () => { const file = focusedFile(); if (file) openPreview(file.asset_id); }); $("#open-large-preview").addEventListener("click", () => { const file = focusedFile(); if (file) openPreview(file.asset_id); }); $("#close-preview").addEventListener("click", closePreview); $("#preview-prev").addEventListener("click", () => previewStep(-1)); $("#preview-next").addEventListener("click", () => previewStep(1)); $("#preview-image").addEventListener("click", (event) => event.target.classList.toggle("zoomed"));
+$("#close-detail").addEventListener("click", () => { state.selected.clear(); state.focusedId = null; $(".detail-pane").classList.remove("open"); renderLibrary(); updateSelection(); });
+document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closePreview(); closeRuleModal(); closeMessage(); } if (!$("#preview-modal").hidden && event.key === "ArrowLeft") previewStep(-1); if (!$("#preview-modal").hidden && event.key === "ArrowRight") previewStep(1); });
 
 (async function boot() {
-  try {
-    await refreshStatus();
-    await refreshJobs();
-  } catch (e) {
-    $("#meta-ready").textContent = "服务异常";
-    $("#meta-ready").className = "meta-chip warn";
-    console.error(e);
-  }
-  setInterval(() => {
-    refreshStatus().catch(() => {});
-    refreshJobs().catch(() => {});
-  }, 2500);
+  try { await Promise.all([refreshStatus(), loadRules(), loadJobs()]); }
+  catch (error) { showError(error); }
+  setInterval(() => { refreshStatus().catch(() => {}); loadJobs().catch(() => {}); }, 4000);
 })();

@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
+import uuid
 from pathlib import Path
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from asset_hub import __version__
-from asset_hub.catalog.db import Catalog
+from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path
 from asset_hub.config import ensure_data_dirs, get_settings
 from asset_hub.jobs import JobStore
+from asset_hub.pack.rules import PackRuleStore, SUPPORTED_HANDLERS
+from asset_hub.pack.ziputil import zip_paths
 
 
 @asynccontextmanager
@@ -64,8 +69,72 @@ def _serve_under_data(
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"}
 
 
+class AssetIdsRequest(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=200)
+
+
+class PackRulePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = Field(default="", max_length=500)
+    handler: str
+    enabled: bool = True
+    sort_order: int = 1000
+    config: dict = Field(default_factory=dict)
+
+
 def _is_previewable(file_name: str) -> bool:
     return Path(file_name or "").suffix.lower() in IMAGE_EXTS
+
+
+def _asset_json(asset: AssetRow) -> dict:
+    return {
+        "asset_id": asset.asset_id,
+        "file_name": asset.file_name,
+        "file_size": asset.file_size,
+        "sku_code": asset.sku_code,
+        "sku_name": asset.sku_name,
+        "virtual_path": asset.virtual_path,
+        "updated_at": asset.updated_at,
+        "previewable": _is_previewable(asset.file_name),
+        "deduplicated": bool(asset.dedup_of_asset_id),
+    }
+
+
+def _safe_library_target(root: Path, virtual_path: str) -> Path:
+    clean = normalize_virtual_path(virtual_path)
+    target = (root / clean).resolve()
+    try:
+        target.relative_to(root.resolve())
+    except ValueError as exc:
+        raise HTTPException(400, "目标目录无效") from exc
+    return target
+
+
+def _download_archive(asset_ids: list[str], background_tasks: BackgroundTasks) -> FileResponse:
+    settings = get_settings()
+    catalog = Catalog(settings)
+    ids = list(dict.fromkeys(asset_ids))[:200]
+    pairs: list[tuple[Path, str]] = []
+    used_names: dict[str, int] = {}
+    for asset_id in ids:
+        asset = catalog.get_asset(asset_id)
+        if not asset or asset.deleted or asset.status != "ready" or not asset.local_path:
+            continue
+        source = Path(asset.local_path)
+        if not source.is_file():
+            continue
+        count = used_names.get(asset.file_name, 0) + 1
+        used_names[asset.file_name] = count
+        arcname = asset.file_name
+        if count > 1:
+            arcname = f"{source.stem}_{count}{source.suffix}"
+        pairs.append((source, arcname))
+    if not pairs:
+        raise HTTPException(404, "所选素材均不可用")
+    archive = settings.tmp_dir / f"素材下载-{uuid.uuid4().hex}.zip"
+    zip_paths(pairs, archive)
+    background_tasks.add_task(archive.unlink, missing_ok=True)
+    return FileResponse(archive, filename="素材下载.zip", media_type="application/zip")
 
 
 @app.get("/health")
@@ -127,17 +196,149 @@ def search(
         "offset": offset,
         "has_more": offset + len(rows) < total,
         "results": [
-            {
-                "asset_id": r.asset_id,
-                "file_name": r.file_name,
-                "file_size": r.file_size,
-                "sku_code": r.sku_code,
-                "sku_name": r.sku_name,
-                "previewable": _is_previewable(r.file_name),
-            }
-            for r in rows
+            _asset_json(r) for r in rows
         ],
     }
+
+
+@app.get("/api/v1/library/tree")
+def library_tree(
+    path: str = "",
+    q: str = "",
+    limit: int = 200,
+    offset: int = 0,
+) -> dict:
+    clean = normalize_virtual_path(path)
+    directories, files, total = Catalog().list_directory(
+        clean, query=q, limit=limit, offset=offset
+    )
+    parts = clean.split("/") if clean else []
+    breadcrumbs = [{"name": "素材库", "path": ""}]
+    for index, part in enumerate(parts):
+        breadcrumbs.append({"name": part, "path": "/".join(parts[: index + 1])})
+    return {
+        "path": clean,
+        "breadcrumbs": breadcrumbs,
+        "directories": directories,
+        "files": [_asset_json(asset) for asset in files],
+        "total_files": total,
+        "has_more": offset + len(files) < total,
+    }
+
+
+@app.post("/api/v1/library/upload")
+async def upload_library_assets(
+    files: list[UploadFile] = File(...),
+    target_path: str = Form(""),
+    relative_paths: str = Form("[]"),
+) -> dict:
+    if not files or len(files) > 200:
+        raise HTTPException(400, "每批必须上传 1 到 200 个文件")
+    settings = get_settings()
+    catalog = Catalog(settings)
+    base = _safe_library_target(settings.library_root, target_path)
+    try:
+        rels = json.loads(relative_paths or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "relative_paths 不是合法 JSON") from exc
+    if not isinstance(rels, list) or (rels and len(rels) != len(files)):
+        raise HTTPException(400, "relative_paths 必须与文件数量一致")
+
+    prepared = []
+    for index, upload in enumerate(files):
+        name = Path(upload.filename or "").name.strip()
+        if not name:
+            raise HTTPException(400, "文件名不能为空")
+        rel = normalize_virtual_path(str(rels[index]) if rels else name)
+        rel_parent = normalize_virtual_path(str(Path(rel).parent)) if "/" in rel else ""
+        destination_dir = _safe_library_target(base, rel_parent)
+        destination = destination_dir / name
+        asset_id = f"upload:{uuid.uuid4().hex}"
+        prepared.append((upload, name, asset_id, destination))
+    duplicates = catalog.reserve_asset_names(
+        [(name, asset_id) for _upload, name, asset_id, _destination in prepared]
+    )
+    existing_paths = [name for _upload, name, _asset_id, dest in prepared if dest.exists()]
+    if existing_paths:
+        catalog.release_asset_name_claims([item[2] for item in prepared])
+        duplicate_names = {str(item.get("file_name") or "").casefold() for item in duplicates}
+        duplicates.extend(
+            {"file_name": name, "reason": "destination_exists"}
+            for name in existing_paths
+            if name.casefold() not in duplicate_names
+        )
+    if duplicates:
+        raise HTTPException(
+            409,
+            {"code": "FILENAME_DUPLICATE", "message": "文件名重复，不允许添加", "duplicates": duplicates},
+        )
+
+    staged: list[tuple[Path, Path]] = []
+    committed: list[Path] = []
+    try:
+        for upload, _name, asset_id, destination in prepared:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            part = destination.parent / f".{destination.name}.{asset_id.split(':', 1)[1]}.part"
+            with part.open("wb") as output:
+                while chunk := await upload.read(1024 * 1024):
+                    output.write(chunk)
+            staged.append((part, destination))
+        for part, destination in staged:
+            part.replace(destination)
+            committed.append(destination)
+        rows = []
+        for _upload, name, asset_id, destination in prepared:
+            stat = destination.stat()
+            virtual_path = normalize_virtual_path(
+                f"{target_path}/{destination.relative_to(base).as_posix()}"
+            )
+            rows.append(
+                AssetRow(
+                    asset_id=asset_id,
+                    kind="library",
+                    storage_key=destination.relative_to(settings.library_root).as_posix(),
+                    file_name=name,
+                    original_filename=name,
+                    file_size=int(stat.st_size),
+                    local_path=str(destination),
+                    status="ready",
+                    updated_at=stat.st_mtime,
+                    virtual_path=virtual_path,
+                )
+            )
+        catalog.upsert_assets(rows)
+        return {"added": len(rows), "files": [_asset_json(row) for row in rows]}
+    except Exception:
+        for part, _destination in staged:
+            part.unlink(missing_ok=True)
+        for destination in committed:
+            destination.unlink(missing_ok=True)
+        catalog.release_asset_name_claims([item[2] for item in prepared])
+        raise
+
+
+@app.post("/api/v1/assets/download")
+def download_assets(
+    payload: AssetIdsRequest, background_tasks: BackgroundTasks
+) -> FileResponse:
+    return _download_archive(payload.ids, background_tasks)
+
+
+@app.post("/api/v1/assets/download-ticket")
+def create_download_ticket(payload: AssetIdsRequest) -> dict:
+    token = uuid.uuid4().hex
+    Catalog().create_download_selection(token, json.dumps(list(dict.fromkeys(payload.ids))))
+    return {"token": token, "download_url": f"/api/v1/assets/download-batch/{token}"}
+
+
+@app.get("/api/v1/assets/download-batch/{token}")
+def download_assets_by_ticket(
+    token: str, background_tasks: BackgroundTasks
+) -> FileResponse:
+    raw = Catalog().get_download_selection(token)
+    if not raw:
+        raise HTTPException(404, "下载选择已过期")
+    return _download_archive(json.loads(raw), background_tasks)
 
 
 @app.get("/api/v1/assets/{asset_id}/download")
@@ -204,6 +405,42 @@ def _preview_asset(asset_id: str) -> Response:
     )
 
 
+@app.get("/api/v1/pack-rules")
+def list_pack_rules() -> dict:
+    store = PackRuleStore()
+    return {
+        "rules": [rule.to_dict() for rule in store.list()],
+        "handlers": list(SUPPORTED_HANDLERS.values()),
+    }
+
+
+@app.post("/api/v1/pack-rules")
+def create_pack_rule(payload: PackRulePayload) -> dict:
+    try:
+        rule = PackRuleStore().create(**payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return rule.to_dict()
+
+
+@app.put("/api/v1/pack-rules/{rule_id}")
+def update_pack_rule(rule_id: str, payload: PackRulePayload) -> dict:
+    try:
+        rule = PackRuleStore().update(rule_id, **payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not rule:
+        raise HTTPException(404, "规则不存在")
+    return rule.to_dict()
+
+
+@app.delete("/api/v1/pack-rules/{rule_id}")
+def delete_pack_rule(rule_id: str) -> dict:
+    if not PackRuleStore().delete(rule_id):
+        raise HTTPException(404, "规则不存在")
+    return {"deleted": True, "id": rule_id}
+
+
 @app.get("/api/v1/jobs")
 def list_jobs(limit: int = 20) -> dict:
     store = JobStore()
@@ -230,6 +467,7 @@ def list_jobs(limit: int = 20) -> dict:
 async def create_job(
     file: UploadFile = File(...),
     super_dir_name: str = Form(""),
+    rule_ids: str = Form(""),
 ) -> dict:
     s = get_settings()
     cat = Catalog(s)
@@ -238,8 +476,24 @@ async def create_job(
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".xlsx", ".xls"}:
         raise HTTPException(400, "仅支持 .xlsx / .xls")
+    selected_ids = None
+    if rule_ids:
+        try:
+            selected_ids = json.loads(rule_ids)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "rule_ids 不是合法 JSON") from exc
+        if not isinstance(selected_ids, list):
+            raise HTTPException(400, "rule_ids 必须是数组")
+    try:
+        rules = PackRuleStore(s).snapshots(selected_ids)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     store = JobStore(s)
-    job = store.create(filename=file.filename or f"input{suffix}", super_dir_name=super_dir_name)
+    job = store.create(
+        filename=file.filename or f"input{suffix}",
+        super_dir_name=super_dir_name,
+        meta={"rules": rules},
+    )
     job_dir = store.job_dir(job.id)
     dest = job_dir / f"input{suffix}"
     with dest.open("wb") as f:
@@ -263,6 +517,7 @@ def get_job(job_id: str) -> dict:
         "progress": job.progress,
         "error": job.error,
         "has_download": bool(job.archive_path and Path(job.archive_path).is_file()),
+        "rules": (job.meta or {}).get("rules", []),
     }
 
 

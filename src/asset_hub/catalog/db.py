@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +47,13 @@ CREATE INDEX IF NOT EXISTS idx_assets_storage ON assets(storage_key);
 CREATE INDEX IF NOT EXISTS idx_assets_name ON assets(file_name);
 CREATE INDEX IF NOT EXISTS idx_assets_sku ON assets(sku_code);
 CREATE INDEX IF NOT EXISTS idx_assets_status ON assets(status);
+
+CREATE TABLE IF NOT EXISTS asset_name_claims (
+  normalized_name TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL,
+  claimed_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_asset_name_claim_asset ON asset_name_claims(asset_id);
 
 CREATE TABLE IF NOT EXISTS finalized_items (
   revision_item_id INTEGER PRIMARY KEY,
@@ -109,11 +117,52 @@ CREATE TABLE IF NOT EXISTS jobs (
   meta_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS pack_rules (
+  id TEXT PRIMARY KEY,
+  rule_key TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  handler TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  config_json TEXT NOT NULL DEFAULT '{}',
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pack_rules_sort ON pack_rules(sort_order, created_at);
+
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS download_selections (
+  token TEXT PRIMARY KEY,
+  asset_ids_json TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_download_selections_created ON download_selections(created_at);
 """
 
 
 def normalize_sku_token(value: str) -> str:
     return value.strip().upper()
+
+
+def normalize_file_name(value: str) -> str:
+    """Global, Unicode-aware filename identity used by upload and OSS sync."""
+    return unicodedata.normalize("NFC", Path(value or "").name.strip()).casefold()
+
+
+def normalize_virtual_path(value: str) -> str:
+    parts = []
+    for raw in str(value or "").replace("\\", "/").split("/"):
+        part = raw.strip()
+        if not part or part in {".", ".."}:
+            continue
+        parts.append(part.replace("\x00", ""))
+    return "/".join(parts)
 
 
 def extract_sku_tokens(*texts: str) -> set[str]:
@@ -151,6 +200,8 @@ class AssetRow:
     retryable: int = 0
     last_error: str = ""
     manifest_id: str = ""
+    virtual_path: str = ""
+    dedup_of_asset_id: str = ""
 
 
 class Catalog:
@@ -190,6 +241,8 @@ class Catalog:
             "retryable": "INTEGER NOT NULL DEFAULT 0",
             "last_error": "TEXT NOT NULL DEFAULT ''",
             "manifest_id": "TEXT NOT NULL DEFAULT ''",
+            "virtual_path": "TEXT NOT NULL DEFAULT ''",
+            "dedup_of_asset_id": "TEXT NOT NULL DEFAULT ''",
         }
         sync_columns = {
             "etag": "TEXT NOT NULL DEFAULT ''",
@@ -201,6 +254,50 @@ class Catalog:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_task_asset "
             "ON assets(task_asset_id) WHERE task_asset_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_virtual_path ON assets(virtual_path)"
+        )
+        conn.execute(
+            """
+            UPDATE assets
+               SET virtual_path=CASE
+                 WHEN kind='library' AND storage_key<>'' THEN storage_key
+                 ELSE file_name
+               END
+             WHERE virtual_path=''
+            """
+        )
+        Catalog._backfill_name_claims(conn)
+
+    @staticmethod
+    def _backfill_name_claims(conn: sqlite3.Connection) -> None:
+        seeded = conn.execute(
+            "SELECT value FROM app_meta WHERE key='asset_name_claims_v1'"
+        ).fetchone()
+        if seeded:
+            return
+        rows = conn.execute(
+            """
+            SELECT asset_id, file_name, local_path FROM assets
+             WHERE deleted=0 AND status='ready' AND file_name<>''
+             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'library' THEN 1 ELSE 2 END,
+                      updated_at DESC, asset_id
+            """
+        ).fetchall()
+        now = time.time()
+        for row in rows:
+            if not row["local_path"] or not Path(row["local_path"]).is_file():
+                continue
+            name_key = normalize_file_name(row["file_name"])
+            if name_key:
+                conn.execute(
+                    "INSERT OR IGNORE INTO asset_name_claims(normalized_name, asset_id, claimed_at) VALUES (?,?,?)",
+                    (name_key, row["asset_id"], now),
+                )
+        conn.execute(
+            "INSERT OR REPLACE INTO app_meta(key, value) VALUES ('asset_name_claims_v1', ?)",
+            (str(now),),
         )
 
     @staticmethod
@@ -238,8 +335,8 @@ class Catalog:
               asset_id, task_asset_id, kind, storage_key, file_name, original_filename,
               file_size, etag, crc64_ecma, whole_hash, format, mime_type,
               sku_code, sku_name, local_path, status, updated_at, deleted,
-              retryable, last_error, manifest_id
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              retryable, last_error, manifest_id, virtual_path, dedup_of_asset_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(asset_id) DO UPDATE SET
               task_asset_id=excluded.task_asset_id,
               kind=excluded.kind,
@@ -260,7 +357,9 @@ class Catalog:
               deleted=excluded.deleted,
               retryable=excluded.retryable,
               last_error=excluded.last_error,
-              manifest_id=excluded.manifest_id
+              manifest_id=excluded.manifest_id,
+              virtual_path=excluded.virtual_path,
+              dedup_of_asset_id=excluded.dedup_of_asset_id
             """,
             (
                 asset.asset_id,
@@ -284,6 +383,8 @@ class Catalog:
                 asset.retryable,
                 asset.last_error,
                 asset.manifest_id,
+                normalize_virtual_path(asset.virtual_path or asset.file_name),
+                asset.dedup_of_asset_id,
             ),
         )
         conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset.asset_id,))
@@ -310,6 +411,13 @@ class Catalog:
                     asset.sku_name,
                 ),
             )
+        if not asset.deleted and asset.status == "ready" and asset.local_path:
+            name_key = normalize_file_name(asset.file_name)
+            if name_key:
+                conn.execute(
+                    "INSERT OR IGNORE INTO asset_name_claims(normalized_name, asset_id, claimed_at) VALUES (?,?,?)",
+                    (name_key, asset.asset_id, now),
+                )
 
     def get_asset(self, asset_id: str) -> AssetRow | None:
         with self.connect() as conn:
@@ -318,14 +426,134 @@ class Catalog:
             ).fetchone()
             return self._row_to_asset(row) if row else None
 
+    def find_asset_by_name(
+        self, file_name: str, *, exclude_asset_id: str = ""
+    ) -> AssetRow | None:
+        name_key = normalize_file_name(file_name)
+        if not name_key:
+            return None
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT a.* FROM asset_name_claims c
+                JOIN assets a ON a.asset_id=c.asset_id
+                WHERE c.normalized_name=? AND a.deleted=0 AND a.status='ready'
+                  AND (?='' OR a.asset_id<>?)
+                """,
+                (name_key, exclude_asset_id, exclude_asset_id),
+            ).fetchone()
+            if not row:
+                return None
+            asset = self._row_to_asset(row)
+            if asset.local_path and Path(asset.local_path).is_file():
+                return asset
+            return None
+
+    def reserve_asset_names(self, items: Sequence[tuple[str, str]]) -> list[dict]:
+        """Atomically reserve a whole upload batch or return every duplicate."""
+        normalized: list[tuple[str, str, str]] = []
+        seen: dict[str, str] = {}
+        duplicates: list[dict] = []
+        for file_name, asset_id in items:
+            key = normalize_file_name(file_name)
+            if not key:
+                duplicates.append({"file_name": file_name, "reason": "invalid_name"})
+                continue
+            if key in seen:
+                duplicates.append({"file_name": file_name, "reason": "duplicate_in_batch"})
+            seen[key] = file_name
+            normalized.append((key, file_name, asset_id))
+        if duplicates:
+            return duplicates
+        now = time.time()
+        with self.connect() as conn:
+            # Serialize the read-then-reserve sequence so two concurrent upload
+            # requests cannot both observe the same name as available.
+            conn.execute("BEGIN IMMEDIATE")
+            # Abandoned reservations are recoverable; fresh reservations still
+            # protect concurrent uploads before their asset rows are inserted.
+            conn.execute(
+                """
+                DELETE FROM asset_name_claims
+                 WHERE claimed_at<?
+                   AND NOT EXISTS (SELECT 1 FROM assets a WHERE a.asset_id=asset_name_claims.asset_id)
+                """,
+                (now - 600,),
+            )
+            for key, file_name, _asset_id in normalized:
+                row = conn.execute(
+                    "SELECT asset_id FROM asset_name_claims WHERE normalized_name=?",
+                    (key,),
+                ).fetchone()
+                if row:
+                    duplicates.append(
+                        {"file_name": file_name, "reason": "filename_exists", "asset_id": row["asset_id"]}
+                    )
+            if duplicates:
+                return duplicates
+            conn.executemany(
+                "INSERT INTO asset_name_claims(normalized_name, asset_id, claimed_at) VALUES (?,?,?)",
+                [(key, asset_id, now) for key, _file_name, asset_id in normalized],
+            )
+        return []
+
+    def release_asset_name_claims(self, asset_ids: Sequence[str]) -> None:
+        ids = [value for value in asset_ids if value]
+        if not ids:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                "DELETE FROM asset_name_claims WHERE asset_id=?",
+                [(asset_id,) for asset_id in ids],
+            )
+
     def mark_tombstone(self, asset_id: str) -> None:
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT file_name FROM assets WHERE asset_id=?", (asset_id,)
+            ).fetchone()
             conn.execute(
                 "UPDATE assets SET deleted=1, status='tombstone', updated_at=? WHERE asset_id=?",
                 (time.time(), asset_id),
             )
             conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
             conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
+            conn.execute("DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,))
+            if row:
+                self._promote_name_claim(conn, row["file_name"])
+
+    @staticmethod
+    def _promote_name_claim(conn: sqlite3.Connection, file_name: str) -> None:
+        """Keep a filename canonical when its previous owning row exits."""
+        name_key = normalize_file_name(file_name)
+        if not name_key:
+            return
+        exists = conn.execute(
+            "SELECT 1 FROM asset_name_claims WHERE normalized_name=?", (name_key,)
+        ).fetchone()
+        if exists:
+            return
+        candidates = conn.execute(
+            """
+            SELECT asset_id, file_name, local_path FROM assets
+             WHERE deleted=0 AND status='ready' AND file_name<>''
+             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'library' THEN 1 ELSE 2 END,
+                      updated_at DESC, asset_id
+            """
+        ).fetchall()
+        for candidate in candidates:
+            if (
+                normalize_file_name(candidate["file_name"]) == name_key
+                and candidate["local_path"]
+                and Path(candidate["local_path"]).is_file()
+            ):
+                # The Python-side normalization deliberately mirrors upload
+                # semantics; SQLite NOCASE is ASCII-only and is insufficient.
+                conn.execute(
+                    "INSERT INTO asset_name_claims(normalized_name, asset_id, claimed_at) VALUES (?,?,?)",
+                    (name_key, candidate["asset_id"], time.time()),
+                )
+                return
 
     def apply_finalized_manifest(
         self, items: Sequence[Any], manifest_id: str
@@ -383,8 +611,24 @@ class Catalog:
                     and float(previous["updated_at"] or 0)
                     == float(item.asset_updated_at or 0)
                 )
+                previous_asset_id = previous["asset_id"] if previous else f"finalized:{task_asset_id}"
+                duplicate = conn.execute(
+                    """
+                    SELECT a.* FROM asset_name_claims c
+                    JOIN assets a ON a.asset_id=c.asset_id
+                    WHERE c.normalized_name=? AND a.asset_id<>?
+                      AND a.deleted=0 AND a.status='ready' AND a.local_path<>''
+                    """,
+                    (normalize_file_name(item.file_name), previous_asset_id),
+                ).fetchone()
+                duplicate_valid = bool(
+                    duplicate and Path(duplicate["local_path"]).is_file()
+                )
+                virtual_path = normalize_virtual_path(
+                    f"{item.sku_code}/{item.file_name}" if item.sku_code else item.file_name
+                )
                 asset = AssetRow(
-                    asset_id=(previous["asset_id"] if previous else f"finalized:{task_asset_id}"),
+                    asset_id=previous_asset_id,
                     task_asset_id=task_asset_id,
                     kind="finalized",
                     storage_key=item.storage_key,
@@ -398,19 +642,37 @@ class Catalog:
                     mime_type=item.mime_type,
                     sku_code=item.sku_code,
                     sku_name=item.product_name,
-                    local_path=(previous["local_path"] or "") if unchanged else "",
-                    status=(previous["status"] or "pending") if unchanged else "pending",
+                    local_path=(
+                        duplicate["local_path"]
+                        if duplicate_valid
+                        else ((previous["local_path"] or "") if unchanged else "")
+                    ),
+                    status=(
+                        "ready"
+                        if duplicate_valid
+                        else ((previous["status"] or "pending") if unchanged else "pending")
+                    ),
                     updated_at=float(item.asset_updated_at or time.time()),
                     deleted=0,
-                    retryable=int(previous["retryable"] or 0) if unchanged else 1,
+                    retryable=(
+                        0
+                        if duplicate_valid
+                        else (int(previous["retryable"] or 0) if unchanged else 1)
+                    ),
                     last_error=(previous["last_error"] or "") if unchanged else "",
                     manifest_id=manifest_id,
+                    virtual_path=virtual_path,
+                    dedup_of_asset_id=(
+                        duplicate["asset_id"]
+                        if duplicate_valid
+                        else ((previous["dedup_of_asset_id"] or "") if unchanged else "")
+                    ),
                 )
                 self._upsert_asset(conn, asset)
 
             exited_rows = conn.execute(
                 """
-                SELECT asset_id, task_asset_id FROM assets a
+                SELECT asset_id, task_asset_id, file_name FROM assets a
                 WHERE kind='finalized' AND deleted=0
                   AND NOT EXISTS (
                     SELECT 1 FROM snapshot_task_assets s
@@ -434,6 +696,8 @@ class Catalog:
             for row in exited_rows:
                 conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (row["asset_id"],))
                 conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (row["asset_id"],))
+                conn.execute("DELETE FROM asset_name_claims WHERE asset_id=?", (row["asset_id"],))
+                self._promote_name_claim(conn, row["file_name"])
 
             for item in items:
                 conn.execute(
@@ -546,7 +810,10 @@ class Catalog:
             local_valid = bool(
                 row.local_path
                 and Path(row.local_path).is_file()
-                and Path(row.local_path).stat().st_size == row.file_size
+                and (
+                    bool(row.dedup_of_asset_id)
+                    or Path(row.local_path).stat().st_size == row.file_size
+                )
             )
             if (
                 verify_all
@@ -566,6 +833,7 @@ class Catalog:
         local_path: str | None = None,
         etag: str | None = None,
         crc64_ecma: str | None = None,
+        dedup_of_asset_id: str | None = None,
         retryable: bool = False,
         error: str = "",
     ) -> None:
@@ -580,16 +848,31 @@ class Catalog:
         if crc64_ecma is not None:
             fields.append("crc64_ecma=?")
             values.append(crc64_ecma)
+        if dedup_of_asset_id is not None:
+            fields.append("dedup_of_asset_id=?")
+            values.append(dedup_of_asset_id)
         values.append(task_asset_id)
         with self.connect() as conn:
             conn.execute(
                 f"UPDATE assets SET {', '.join(fields)} WHERE task_asset_id=?", values
             )
+            if status == "ready":
+                row = conn.execute(
+                    "SELECT asset_id, file_name, local_path FROM assets WHERE task_asset_id=?",
+                    (task_asset_id,),
+                ).fetchone()
+                if row and row["local_path"] and Path(row["local_path"]).is_file():
+                    name_key = normalize_file_name(row["file_name"])
+                    if name_key:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO asset_name_claims(normalized_name, asset_id, claimed_at) VALUES (?,?,?)",
+                            (name_key, row["asset_id"], time.time()),
+                        )
 
     def mark_task_asset_tombstone(self, task_asset_id: int) -> None:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT asset_id FROM assets WHERE task_asset_id=?", (task_asset_id,)
+                "SELECT asset_id, file_name FROM assets WHERE task_asset_id=?", (task_asset_id,)
             ).fetchone()
             conn.execute(
                 """
@@ -606,6 +889,8 @@ class Catalog:
             if row:
                 conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (row["asset_id"],))
                 conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (row["asset_id"],))
+                conn.execute("DELETE FROM asset_name_claims WHERE asset_id=?", (row["asset_id"],))
+                self._promote_name_claim(conn, row["file_name"])
 
     def finalized_cache_complete(self, manifest_id: str) -> bool:
         state = self.get_sync_state("finalized")
@@ -615,9 +900,66 @@ class Catalog:
             if asset.status != "ready" or not asset.local_path:
                 return False
             path = Path(asset.local_path)
-            if not path.is_file() or path.stat().st_size != asset.file_size:
+            if not path.is_file() or (
+                not asset.dedup_of_asset_id and path.stat().st_size != asset.file_size
+            ):
                 return False
         return True
+
+    def list_directory(
+        self,
+        virtual_path: str = "",
+        *,
+        query: str = "",
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[list[dict], list[AssetRow], int]:
+        """Return one level of the unified virtual tree without source labels."""
+        base = normalize_virtual_path(virtual_path)
+        prefix = f"{base}/" if base else ""
+        limit = max(1, min(limit, 500))
+        offset = max(0, offset)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT a.* FROM asset_name_claims c
+                JOIN assets a ON a.asset_id=c.asset_id
+                WHERE a.deleted=0 AND a.status='ready' AND a.virtual_path LIKE ?
+                ORDER BY a.virtual_path COLLATE NOCASE, a.asset_id
+                """,
+                (prefix + "%",),
+            ).fetchall()
+        folders: dict[str, dict] = {}
+        files: list[AssetRow] = []
+        q = query.strip().casefold()
+        for row in rows:
+            full_path = normalize_virtual_path(row["virtual_path"])
+            if not full_path.startswith(prefix):
+                continue
+            rel = full_path[len(prefix) :]
+            if not rel:
+                continue
+            head, sep, _tail = rel.partition("/")
+            if sep:
+                entry = folders.setdefault(
+                    head,
+                    {"name": head, "path": f"{prefix}{head}", "file_count": 0},
+                )
+                entry["file_count"] += 1
+                continue
+            asset = self._row_to_asset(row)
+            if q and q not in " ".join(
+                [asset.file_name, asset.sku_code, asset.sku_name, asset.virtual_path]
+            ).casefold():
+                continue
+            files.append(asset)
+        files.sort(key=lambda item: (item.file_name.casefold(), item.asset_id))
+        total = len(files)
+        return (
+            sorted(folders.values(), key=lambda item: item["name"].casefold()),
+            files[offset : offset + limit],
+            total,
+        )
 
     def search(
         self,
@@ -631,29 +973,32 @@ class Catalog:
         offset = max(0, offset)
         q = query.strip()
         priority_order = """
-          CASE kind
+          CASE a.kind
             WHEN 'finalized' THEN 0
             WHEN 'library' THEN 1
             WHEN 'archive' THEN 2
             ELSE 3
           END,
-          updated_at DESC,
-          asset_id ASC
+          a.updated_at DESC,
+          a.asset_id ASC
         """
         with self.connect() as conn:
             if not q:
-                where = "deleted=0 AND status='ready'"
+                where = "a.deleted=0 AND a.status='ready'"
                 args: list = []
                 if kind:
-                    where += " AND kind=?"
+                    where += " AND a.kind=?"
                     args.append(kind)
                 total = int(
-                    conn.execute(f"SELECT COUNT(*) AS c FROM assets WHERE {where}", args).fetchone()[
+                    conn.execute(
+                        f"SELECT COUNT(*) AS c FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where}",
+                        args,
+                    ).fetchone()[
                         "c"
                     ]
                 )
                 rows = conn.execute(
-                    f"SELECT * FROM assets WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
+                    f"SELECT a.* FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
@@ -663,6 +1008,7 @@ class Catalog:
             base = """
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
+              JOIN asset_name_claims c ON c.asset_id=a.asset_id
               WHERE t.token=? AND a.deleted=0 AND a.status='ready'
             """
             args = [token]
@@ -692,6 +1038,7 @@ class Catalog:
                     fts_term = f"{match}*"
                 base = """
                   FROM assets a
+                  JOIN asset_name_claims c ON c.asset_id=a.asset_id
                   JOIN assets_fts f ON f.asset_id=a.asset_id
                   WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
                 """
@@ -717,22 +1064,22 @@ class Catalog:
             except sqlite3.OperationalError:
                 like = f"%{q}%"
                 where = """
-                  deleted=0 AND status='ready' AND (
-                    file_name LIKE ? OR original_filename LIKE ?
-                    OR sku_code LIKE ? OR storage_key LIKE ?
+                  a.deleted=0 AND a.status='ready' AND (
+                    a.file_name LIKE ? OR a.original_filename LIKE ?
+                    OR a.sku_code LIKE ? OR a.storage_key LIKE ?
                   )
                 """
                 args3: list = [like, like, like, like]
                 if kind:
-                    where += " AND kind=?"
+                    where += " AND a.kind=?"
                     args3.append(kind)
                 total = int(
                     conn.execute(
-                        f"SELECT COUNT(*) AS c FROM assets WHERE {where}", args3
+                        f"SELECT COUNT(*) AS c FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where}", args3
                     ).fetchone()["c"]
                 )
                 rows = conn.execute(
-                    f"SELECT * FROM assets WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
+                    f"SELECT a.* FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args3, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
@@ -749,9 +1096,32 @@ class Catalog:
         """Count every locally usable asset in the unified catalog."""
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) AS c FROM assets WHERE deleted=0 AND status='ready'"
+                """
+                SELECT COUNT(*) AS c FROM asset_name_claims n
+                JOIN assets a ON a.asset_id=n.asset_id
+                WHERE a.deleted=0 AND a.status='ready'
+                """
             ).fetchone()
             return int(row["c"]) if row else 0
+
+    def create_download_selection(self, token: str, asset_ids_json: str) -> None:
+        now = time.time()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM download_selections WHERE created_at<?", (now - 900,))
+            conn.execute(
+                "INSERT INTO download_selections(token, asset_ids_json, created_at) VALUES (?,?,?)",
+                (token, asset_ids_json, now),
+            )
+
+    def get_download_selection(self, token: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT asset_ids_json, created_at FROM download_selections WHERE token=?",
+                (token,),
+            ).fetchone()
+            if not row or float(row["created_at"] or 0) < time.time() - 900:
+                return None
+            return str(row["asset_ids_json"])
 
     def order_current_assets(self, assets: Sequence[AssetRow]) -> list[AssetRow]:
         """Order current-version candidates by finalized metadata and remove duplicates."""
@@ -901,6 +1271,8 @@ class Catalog:
             retryable=int(row["retryable"] or 0),
             last_error=row["last_error"] or "",
             manifest_id=row["manifest_id"] or "",
+            virtual_path=row["virtual_path"] or "",
+            dedup_of_asset_id=row["dedup_of_asset_id"] or "",
         )
 
 

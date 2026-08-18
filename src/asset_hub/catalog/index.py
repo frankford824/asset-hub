@@ -50,6 +50,7 @@ def index_library(
                     updated_at=st.st_mtime,
                     sku_code="",
                     sku_name="",
+                    virtual_path=rel,
                 )
             )
             count += 1

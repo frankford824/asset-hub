@@ -1,207 +1,152 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>云仓资源下载器</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,500;9..40,700&family=JetBrains+Mono:wght@450;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/styles.css?v=9" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>统一素材库</title>
+  <link rel="stylesheet" href="/styles.css?v=12" />
 </head>
 <body>
-  <div class="app">
-    <header class="topbar">
-      <div class="topbar-inner">
-        <div class="brand-block">
-          <div class="brand-title">云仓资源下载器</div>
-          <nav class="tabs" role="tablist">
-            <button type="button" class="tab active" data-tab="pack" role="tab" aria-selected="true">订单打包</button>
-            <button type="button" class="tab" data-tab="library" role="tab" aria-selected="false">统一素材库</button>
-          </nav>
-        </div>
-        <div class="top-meta">
-          <span id="meta-count" class="meta-chip">素材 —</span>
-          <span id="meta-ready" class="meta-chip soft">检测中</span>
-          <button id="btn-refresh-meta" class="icon-btn" type="button" title="刷新">↻</button>
-        </div>
+  <header class="topbar">
+    <div class="brand" aria-label="统一素材库">
+      <span class="brand-mark">A</span>
+      <span><strong>统一素材库</strong><small>Asset Hub</small></span>
+    </div>
+    <nav class="tabs" aria-label="主要功能">
+      <button class="tab active" data-tab="pack" type="button">新建打包</button>
+      <button class="tab" data-tab="library" type="button">资源库</button>
+    </nav>
+    <div class="top-meta">
+      <span id="meta-count">素材 —</span>
+      <span id="meta-ready" class="status-dot">连接中</span>
+      <button id="btn-refresh" class="icon-btn" type="button" title="刷新" aria-label="刷新">↻</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="view-pack" class="view pack-view">
+      <div class="page-heading">
+        <div><h1>新建打包</h1><p>导入订单表，按本次勾选的规则生成结果包。</p></div>
+        <button id="add-rule" class="btn secondary" type="button">＋ 添加规则</button>
       </div>
-    </header>
 
-    <main class="shell">
-      <section id="view-pack" class="view active" role="tabpanel">
-        <div class="pack-layout">
-          <aside class="pack-primary">
-            <div class="hero-card">
-              <div class="hero-kicker">主流程</div>
-              <h1>新建打包</h1>
-              <p class="hero-desc">上传订单表，从统一素材库自动优选并生成下载包</p>
-              <form id="pack-form" class="pack-form">
-                <div class="field">
-                  <label for="excel">订单表（.xlsx / .xls）</label>
-                  <input id="excel" type="file" accept=".xlsx,.xls" required />
-                </div>
-                <div class="field">
-                  <label for="super">打包文件夹名称 <span class="opt">可选</span></label>
-                  <input id="super" type="text" placeholder="不填则自动生成" autocomplete="off" />
-                </div>
-                <label class="check-row">
-                  <input id="auto-download" type="checkbox" checked />
-                  完成后自动下载
-                </label>
-                <button id="pack-submit" class="btn btn-primary btn-lg" type="submit">
-                  <span class="btn-label">开始处理</span>
-                </button>
-                <p id="pack-msg" class="form-msg" hidden></p>
-              </form>
-            </div>
-          </aside>
+      <div class="pack-layout">
+        <form id="pack-form" class="pack-form panel">
+          <div class="section-title"><span>1</span><div><h2>订单文件</h2><p>支持 .xlsx / .xls，默认读取第一个工作表。</p></div></div>
+          <label class="file-drop" id="excel-drop">
+            <input id="excel" name="file" type="file" accept=".xlsx,.xls" required />
+            <span class="drop-icon">X</span>
+            <strong id="excel-label">拖入订单 Excel，或点击选择</strong>
+            <small>文件只用于本次打包任务</small>
+          </label>
+          <label class="field"><span>结果包顶层目录</span><input id="super" type="text" placeholder="默认：pack" maxlength="80" /></label>
+          <div class="selected-summary"><span>已选择 <strong id="selected-rule-count">0</strong> 条规则</span><button id="select-all-rules" type="button">全选</button></div>
+          <button id="pack-submit" class="btn primary wide" type="submit">提交打包</button>
+          <p id="pack-msg" class="form-message" hidden></p>
+        </form>
 
-          <div class="pack-secondary">
-            <div class="card" id="progress-card">
-              <div class="card-head">
-                <div>
-                  <h2>当前任务</h2>
-                  <p id="progress-label" class="sub">暂无进行中的任务</p>
-                </div>
-                <div id="progress-pct" class="pct">—</div>
-              </div>
-              <div class="card-body">
-                <div class="bar"><i id="progress-fill"></i></div>
-                <div class="steps">
-                  <span data-s="queued">排队</span>
-                  <span data-s="running">处理</span>
-                  <span data-s="done">完成</span>
-                </div>
-                <dl class="kv">
-                  <div><dt>订单表</dt><dd id="meta-filename">—</dd></div>
-                  <div><dt>开始</dt><dd id="meta-started">—</dd></div>
-                  <div><dt>完成</dt><dd id="meta-finished">—</dd></div>
-                </dl>
-                <div id="progress-actions" class="row-actions" hidden>
-                  <a id="progress-download" class="btn btn-success" href="#">下载结果</a>
-                  <button id="btn-job-detail" class="btn btn-ghost" type="button">详情</button>
-                </div>
-              </div>
-            </div>
+        <section class="rules-panel panel" aria-labelledby="rules-title">
+          <div class="panel-head"><div><h2 id="rules-title">打包规则</h2><p>默认全部勾选；取消只影响本次任务。</p></div><span id="rule-sync-note">与 eve35 已校对</span></div>
+          <div id="rules-list" class="rules-list"><div class="loading">正在加载规则…</div></div>
+        </section>
+      </div>
 
-            <div class="card">
-              <div class="card-head compact">
-                <h2>最近结果</h2>
-                <button id="btn-open-jobs" class="btn btn-ghost btn-sm" type="button">全部记录</button>
-              </div>
-              <div id="jobs-preview" class="job-preview">
-                <div class="empty">暂无记录</div>
-              </div>
-            </div>
-          </div>
-        </div>
+      <section class="jobs-section panel">
+        <div class="panel-head"><div><h2>最近任务</h2><p>结果包完成后可直接下载。</p></div><button id="refresh-jobs" class="text-btn" type="button">刷新</button></div>
+        <div id="jobs-list" class="jobs-list"><div class="empty">暂无任务</div></div>
       </section>
+    </section>
 
-      <section id="view-library" class="view" role="tabpanel" hidden>
-        <div class="lib-toolbar">
-          <div class="search-box live">
-            <input id="q" type="search" placeholder="实时搜索货号、名称或文件名…" autocomplete="off" />
-            <span id="search-spin" class="search-spin" hidden aria-hidden="true"></span>
+    <section id="view-library" class="view library-view" hidden>
+      <div class="library-toolbar">
+        <div class="history-actions">
+          <button id="nav-back" class="icon-btn" type="button" title="后退">←</button>
+          <button id="nav-up" class="icon-btn" type="button" title="上一级">↑</button>
+          <button id="nav-home" class="icon-btn" type="button" title="素材库根目录">⌂</button>
+        </div>
+        <nav id="breadcrumbs" class="breadcrumbs" aria-label="当前位置"></nav>
+        <label class="search"><span>⌕</span><input id="library-search" type="search" placeholder="搜索当前目录" /></label>
+        <input id="file-picker" type="file" multiple hidden />
+        <input id="folder-picker" type="file" webkitdirectory multiple hidden />
+        <button id="upload-files" class="btn primary" type="button">上传文件</button>
+        <button id="upload-folder" class="btn secondary" type="button">上传文件夹</button>
+        <button id="download-selected" class="btn secondary" type="button" disabled>下载所选</button>
+      </div>
+
+      <div class="file-workspace">
+        <aside class="tree-pane">
+          <div class="pane-title">目录</div>
+          <div id="directory-tree" class="directory-tree"></div>
+          <div class="tree-help">目录为统一逻辑视图，不区分素材来源。</div>
+        </aside>
+
+        <section class="files-pane" id="files-pane">
+          <div class="files-head">
+            <div><strong id="folder-title">素材库</strong><span id="folder-count">0 项</span></div>
+            <div><span id="selection-count">未选择</span><button id="clear-selection" class="text-btn" type="button" hidden>取消选择</button></div>
           </div>
-          <div class="lib-meta">
-            <span id="lib-total">—</span>
-            <span class="dot">·</span>
-            <span>瀑布流预览</span>
+          <div id="upload-banner" class="upload-banner" hidden>正在添加资源…</div>
+          <div id="file-canvas" class="file-canvas" tabindex="0">
+            <div id="drop-zone" class="drop-zone" hidden><strong>松开以添加到当前目录</strong><span>同名文件会被拒绝，不会覆盖</span></div>
+            <div id="folder-grid" class="folder-grid"></div>
+            <div id="file-grid" class="file-grid"></div>
+            <button id="load-more" class="btn secondary load-more" type="button" hidden>加载更多</button>
+            <div id="selection-box" class="selection-box" hidden></div>
+            <div id="library-empty" class="empty large" hidden>当前目录为空，可将文件拖入此处。</div>
           </div>
-        </div>
+        </section>
 
-        <div id="lib-loading" class="loading-block" hidden>
-          <div class="orbit-loader sm"><span></span><span></span><span></span></div>
-          <span>正在加载…</span>
-        </div>
-
-        <div id="results" class="waterfall"></div>
-
-        <div id="pager" class="pager" hidden>
-          <button id="page-prev" class="btn btn-ghost btn-sm" type="button">上一页</button>
-          <span id="page-info" class="page-info">1 / 1</span>
-          <button id="page-next" class="btn btn-ghost btn-sm" type="button">下一页</button>
-        </div>
-      </section>
-    </main>
-  </div>
-
-  <!-- Pack status overlay -->
-  <div id="pack-overlay" class="pack-overlay" hidden>
-    <div class="pack-overlay-card" role="status" aria-live="polite">
-      <div id="pack-anim-busy" class="pack-anim">
-        <div class="orbit-loader"><span></span><span></span><span></span><span></span></div>
-        <div class="ring-pulse"></div>
+        <aside class="detail-pane">
+          <div class="pane-title">文件详情<button id="close-detail" class="close-detail" type="button" aria-label="关闭详情">×</button></div>
+          <div id="detail-empty" class="detail-empty">选择文件后查看预览和属性</div>
+          <div id="file-detail" class="file-detail" hidden>
+            <button id="detail-preview" class="detail-preview" type="button"><img id="detail-image" alt="文件预览" /><span id="detail-placeholder"></span></button>
+            <h2 id="detail-name"></h2>
+            <dl>
+              <div><dt>文件大小</dt><dd id="detail-size"></dd></div>
+              <div><dt>修改时间</dt><dd id="detail-time"></dd></div>
+              <div><dt>虚拟路径</dt><dd id="detail-path"></dd></div>
+              <div><dt>SKU</dt><dd id="detail-sku"></dd></div>
+              <div><dt>去重状态</dt><dd id="detail-dedup"></dd></div>
+            </dl>
+            <div class="detail-actions">
+              <button id="open-large-preview" class="btn primary wide" type="button">查看大图</button>
+              <a id="single-download" class="btn secondary wide" href="#">下载文件</a>
+            </div>
+            <p class="drag-tip">可直接把选中文件拖到桌面；多选时拖出一个 ZIP。</p>
+          </div>
+        </aside>
       </div>
-      <div id="pack-anim-done" class="pack-anim done" hidden>
-        <svg class="check-svg" viewBox="0 0 52 52" aria-hidden="true">
-          <circle class="check-circle" cx="26" cy="26" r="24" fill="none" />
-          <path class="check-mark" fill="none" d="M14 27 l8 8 16-16" />
-        </svg>
-      </div>
-      <h3 id="pack-overlay-title">正在打包</h3>
-      <p id="pack-overlay-sub" class="sub">匹配资源并生成压缩包…</p>
-      <div class="overlay-bar"><i id="overlay-fill"></i></div>
-      <div id="pack-overlay-actions" class="row-actions center" hidden>
-        <a id="overlay-download" class="btn btn-success" href="#">下载结果</a>
-        <button id="overlay-close" class="btn btn-ghost" type="button">完成</button>
-      </div>
-    </div>
-  </div>
+    </section>
+  </main>
 
-  <div id="drawer-backdrop" class="backdrop" hidden></div>
-  <aside id="jobs-drawer" class="drawer" hidden aria-hidden="true">
-    <div class="drawer-head">
-      <div>
-        <h2>打包记录</h2>
-        <p class="sub">查看进度与下载结果</p>
-      </div>
-      <button type="button" class="icon-btn" data-close="drawer">✕</button>
-    </div>
-    <div id="jobs-list" class="drawer-body">
-      <div class="empty">暂无记录</div>
-    </div>
-  </aside>
+  <div id="modal-backdrop" class="modal-backdrop" hidden></div>
+  <section id="rule-modal" class="modal" role="dialog" aria-modal="true" hidden>
+    <header><div><h2 id="rule-modal-title">添加规则</h2><p>规则行为必须选择系统支持的执行器。</p></div><button data-close-modal class="icon-btn" type="button">×</button></header>
+    <form id="rule-form">
+      <input id="rule-id" type="hidden" />
+      <label class="field"><span>规则名称</span><input id="rule-name" required maxlength="80" /></label>
+      <label class="field"><span>规则描述</span><textarea id="rule-description" rows="3" maxlength="500"></textarea></label>
+      <label class="field"><span>执行行为</span><select id="rule-handler" required></select></label>
+      <label class="field inline"><input id="rule-enabled" type="checkbox" checked /><span>启用并在新任务中默认勾选</span></label>
+      <div class="modal-actions"><button data-close-modal class="btn secondary" type="button">取消</button><button class="btn primary" type="submit">保存规则</button></div>
+    </form>
+  </section>
 
-  <div id="job-modal" class="backdrop modal-wrap" hidden>
-    <div class="modal" role="dialog" aria-modal="true">
-      <div class="modal-head">
-        <div>
-          <h2>任务详情</h2>
-          <p id="job-modal-sub" class="sub">—</p>
-        </div>
-        <button type="button" class="icon-btn" data-close="job-modal">✕</button>
-      </div>
-      <div id="job-modal-body" class="modal-body"></div>
-    </div>
-  </div>
+  <section id="message-modal" class="modal compact" role="alertdialog" aria-modal="true" hidden>
+    <header><div><h2 id="message-title">提示</h2></div><button data-close-message class="icon-btn" type="button">×</button></header>
+    <div class="message-body" id="message-body"></div>
+    <div class="modal-actions"><button data-close-message class="btn primary" type="button">知道了</button></div>
+  </section>
 
-  <div id="preview-modal" class="backdrop preview-wrap" hidden>
-    <div class="preview-modal" role="dialog" aria-modal="true">
-      <div class="modal-head">
-        <div>
-          <h2 id="preview-title">预览</h2>
-          <p id="preview-sub" class="sub">—</p>
-        </div>
-        <div class="row-actions">
-          <button id="preview-prev" class="btn btn-ghost btn-sm" type="button">上一张</button>
-          <button id="preview-next" class="btn btn-ghost btn-sm" type="button">下一张</button>
-          <a id="preview-download" class="btn btn-ghost btn-sm" href="#" download>下载</a>
-          <button type="button" class="icon-btn" data-close="preview-modal">✕</button>
-        </div>
-      </div>
-      <div class="preview-stage" id="preview-stage">
-        <div id="preview-loading" class="loading-block on-dark">
-          <div class="orbit-loader sm light"><span></span><span></span><span></span></div>
-          <span>加载预览…</span>
-        </div>
-        <img id="preview-img" alt="预览" hidden />
-      </div>
-      <p class="preview-tip">左右键翻页 · 点击图片放大</p>
-    </div>
-  </div>
+  <section id="preview-modal" class="preview-modal" role="dialog" aria-modal="true" hidden>
+    <header><div><h2 id="preview-title">预览</h2><p id="preview-sub"></p></div><button id="close-preview" class="icon-btn light" type="button">×</button></header>
+    <button id="preview-prev" class="preview-nav prev" type="button">‹</button>
+    <div class="preview-stage"><img id="preview-image" alt="大图预览" /></div>
+    <button id="preview-next" class="preview-nav next" type="button">›</button>
+  </section>
 
-  <script src="/app.js?v=9"></script>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js?v=12"></script>
 </body>
 </html>
