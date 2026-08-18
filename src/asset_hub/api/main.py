@@ -25,6 +25,7 @@ from asset_hub.pack.ziputil import zip_paths
 async def lifespan(_app: FastAPI):
     ensure_data_dirs()
     Catalog()
+    JobStore()
     yield
 
 
@@ -464,7 +465,7 @@ def list_jobs(limit: int = 20) -> dict:
 
 
 @app.post("/api/v1/jobs")
-async def create_job(
+def create_job(
     file: UploadFile = File(...),
     super_dir_name: str = Form(""),
     rule_ids: str = Form(""),
@@ -493,11 +494,23 @@ async def create_job(
         filename=file.filename or f"input{suffix}",
         super_dir_name=super_dir_name,
         meta={"rules": rules},
+        enqueue=False,
     )
     job_dir = store.job_dir(job.id)
     dest = job_dir / f"input{suffix}"
-    with dest.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+    try:
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+        store.enqueue(job.id)
+    except Exception as exc:
+        store.update(
+            job.id,
+            status="failed",
+            error=str(exc),
+            progress={"percent": 0, "label": "upload failed"},
+            finished=True,
+        )
+        raise
     return {"job_id": job.id}
 
 
@@ -550,7 +563,10 @@ def run() -> None:
         "asset_hub.api.main:app",
         host=s.api.host,
         port=s.api.port,
-        workers=1,
+        workers=s.api.workers,
+        backlog=s.api.backlog,
+        limit_concurrency=s.api.limit_concurrency,
+        timeout_keep_alive=30,
         log_level="info",
     )
 

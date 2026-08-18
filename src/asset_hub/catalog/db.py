@@ -13,6 +13,7 @@ from typing import Any, Iterator, Sequence
 from asset_hub.config import Settings, ensure_data_dirs, get_settings
 
 SKU_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_.]{2,}")
+SKU_QUERY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*\d+$")
 
 
 SCHEMA = """
@@ -513,6 +514,51 @@ class Catalog:
             ).fetchone()
             return self._row_to_asset(row) if row else None
 
+    def library_fingerprints(self) -> dict[str, dict[str, Any]]:
+        """Return the minimal state needed to skip unchanged filesystem rows."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT asset_id,file_name,file_size,updated_at,local_path,
+                       virtual_path,status,deleted
+                  FROM assets WHERE kind='library'
+                """
+            ).fetchall()
+        return {row["asset_id"]: dict(row) for row in rows}
+
+    def tombstone_library_assets(
+        self, asset_ids: Sequence[str], *, batch_size: int = 25
+    ) -> int:
+        ids = [asset_id for asset_id in asset_ids if asset_id]
+        changed = 0
+        for start in range(0, len(ids), max(1, batch_size)):
+            with self.connect() as conn:
+                for asset_id in ids[start : start + batch_size]:
+                    row = conn.execute(
+                        """
+                        SELECT file_name FROM assets
+                         WHERE asset_id=? AND kind='library' AND deleted=0
+                        """,
+                        (asset_id,),
+                    ).fetchone()
+                    if not row:
+                        continue
+                    conn.execute(
+                        """
+                        UPDATE assets SET deleted=1,status='tombstone',updated_at=?
+                         WHERE asset_id=?
+                        """,
+                        (time.time(), asset_id),
+                    )
+                    conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
+                    conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
+                    conn.execute(
+                        "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
+                    )
+                    self._promote_name_claim(conn, row["file_name"])
+                    changed += 1
+        return changed
+
     def find_asset_by_name(
         self, file_name: str, *, exclude_asset_id: str = ""
     ) -> AssetRow | None:
@@ -624,9 +670,11 @@ class Catalog:
             """
             SELECT asset_id, file_name, local_path FROM assets
              WHERE deleted=0 AND status='ready' AND file_name<>''
+               AND file_name=? COLLATE NOCASE
              ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'library' THEN 1 ELSE 2 END,
                       updated_at DESC, asset_id
-            """
+            """,
+            (file_name,),
         ).fetchall()
         for candidate in candidates:
             if (
@@ -1116,6 +1164,12 @@ class Catalog:
                     [*args, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total
+
+            # A syntactically complete SKU that is absent from the exact token
+            # index cannot be rescued by prefix FTS. Returning immediately keeps
+            # missing-code packaging O(1), especially for large catalogs.
+            if SKU_QUERY_RE.fullmatch(q):
+                return [], 0
 
             # FTS fallback
             try:

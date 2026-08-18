@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 
@@ -210,6 +211,30 @@ def test_index_library(settings):
     assert len(hits[0]) == 1
 
 
+def test_index_skips_unchanged_and_tombstones_removed(settings):
+    root = settings.library_root
+    path = root / "SKU90001.jpg"
+    path.write_bytes(b"image")
+    catalog = Catalog(settings)
+    assert index_library(catalog, root, settings.sync.ignore_globs) == 1
+
+    writes: list[int] = []
+    original = catalog.upsert_assets
+
+    def counted(assets):
+        writes.append(len(assets))
+        return original(assets)
+
+    catalog.upsert_assets = counted  # type: ignore[method-assign]
+    assert index_library(catalog, root, settings.sync.ignore_globs) == 1
+    assert writes == []
+
+    path.unlink()
+    assert index_library(catalog, root, settings.sync.ignore_globs) == 0
+    asset = catalog.get_asset("lib:SKU90001.jpg")
+    assert asset is not None and asset.deleted == 1 and asset.status == "tombstone"
+
+
 def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
     catalog = Catalog(settings)
     key = str(catalog.db_path.resolve())
@@ -254,6 +279,8 @@ def test_excel_match_and_job(settings):
     assert missing
 
     store = JobStore(settings)
+    assert store.db_path == settings.jobs_db_path
+    assert store.db_path != settings.db_path
     job = store.create(filename="pack.xlsx", super_dir_name="demo")
     job_dir = store.job_dir(job.id)
     (job_dir / "input.xlsx").write_bytes(xlsx.read_bytes())
@@ -275,6 +302,64 @@ def test_excel_match_and_job(settings):
         report = zf.read(report_names[0]).decode("utf-8")
         assert "当前优选" in report
         assert "MISSING999" in report
+
+
+def test_job_store_accepts_and_claims_100_concurrent_jobs(settings):
+    store = JobStore(settings)
+
+    def create_one(index: int) -> str:
+        return store.create(filename=f"load-{index}.xlsx").id
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        created = list(executor.map(create_one, range(120)))
+    assert len(set(created)) == 120
+
+    def claim_all() -> list[str]:
+        claimed: list[str] = []
+        while True:
+            job = store.claim_next()
+            if not job:
+                return claimed
+            claimed.append(job.id)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        groups = list(executor.map(lambda _index: claim_all(), range(8)))
+    claimed_ids = [job_id for group in groups for job_id in group]
+    assert len(claimed_ids) == 120
+    assert set(claimed_ids) == set(created)
+
+
+def test_job_queue_is_not_blocked_by_catalog_writer(settings):
+    catalog = Catalog(settings)
+    store = JobStore(settings)
+    writer = sqlite3.connect(catalog.db_path, timeout=1)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        started = time.perf_counter()
+        job = store.create(filename="independent.xlsx")
+        assert time.perf_counter() - started < 0.5
+        assert job.status == "queued"
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_job_store_migrates_legacy_catalog_jobs(settings):
+    catalog = Catalog(settings)
+    with catalog.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO jobs(
+              id,status,created_at,filename,progress_json,meta_json
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            ("legacy-job", "done", 1.0, "legacy.xlsx", "{}", "{}"),
+        )
+    if settings.jobs_db_path.exists():
+        settings.jobs_db_path.unlink()
+    JobStore._initialized_paths.discard(str(settings.jobs_db_path.resolve()))
+    migrated = JobStore(settings).get("legacy-job")
+    assert migrated is not None and migrated.status == "done"
 
 
 def test_api_health_search(settings):

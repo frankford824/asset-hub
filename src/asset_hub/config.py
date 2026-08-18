@@ -28,6 +28,9 @@ class SyncConfig(BaseModel):
 class ApiConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8080
+    workers: int = Field(default=4, ge=1, le=16)
+    backlog: int = Field(default=2048, ge=128, le=65535)
+    limit_concurrency: int = Field(default=512, ge=100, le=4096)
 
 
 class Settings(BaseModel):
@@ -35,6 +38,7 @@ class Settings(BaseModel):
     data_root: Path = Path("/var/lib/asset-hub")
     local_only: bool = True
     workers: int = 3
+    pack_workers: int = Field(default=4, ge=1, le=12)
     provider: str = "mock"  # mock | http
     http: HttpConfig = Field(default_factory=HttpConfig)
     sync: SyncConfig = Field(default_factory=SyncConfig)
@@ -43,6 +47,10 @@ class Settings(BaseModel):
     @property
     def db_path(self) -> Path:
         return self.data_root / "db" / "catalog.sqlite3"
+
+    @property
+    def jobs_db_path(self) -> Path:
+        return self.data_root / "db" / "jobs.sqlite3"
 
     @property
     def finalized_dir(self) -> Path:

@@ -3,6 +3,7 @@ library_root: /home/resourse
 data_root: /var/lib/asset-hub
 local_only: true
 workers: 3
+pack_workers: 4       # 同时执行的打包任务数；额外任务进入独立WAL队列
 provider: mock          # mock | http
 http:
   base_url: ""          # yongboWorkflow 服务根地址，例如 https://api.example.com
@@ -22,3 +23,6 @@ sync:
 api:
   host: 127.0.0.1
   port: 8080
+  workers: 4
+  backlog: 2048
+  limit_concurrency: 512

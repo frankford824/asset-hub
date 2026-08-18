@@ -13,6 +13,7 @@ WorkingDirectory=/opt/asset-hub
 ExecStart=/opt/asset-hub/.venv/bin/asset-hub-worker
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=300
 LimitNOFILE=65535
 NoNewPrivileges=true
 

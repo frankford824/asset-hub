@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -10,6 +11,32 @@ from pathlib import Path
 from typing import Iterator
 
 from asset_hub.config import Settings, get_settings
+
+
+JOBS_SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA temp_store=MEMORY;
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  created_at REAL NOT NULL,
+  started_at REAL,
+  finished_at REAL,
+  filename TEXT NOT NULL DEFAULT '',
+  super_dir_name TEXT NOT NULL DEFAULT '',
+  progress_json TEXT NOT NULL DEFAULT '{}',
+  error TEXT NOT NULL DEFAULT '',
+  archive_path TEXT NOT NULL DEFAULT '',
+  meta_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, created_at);
+CREATE TABLE IF NOT EXISTS app_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT ''
+);
+"""
 
 
 @dataclass
@@ -28,18 +55,65 @@ class Job:
 
 
 class JobStore:
+    _init_lock = threading.Lock()
+    _initialized_paths: set[str] = set()
+
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
-        self.db_path = self.settings.db_path
-        # schema created by Catalog; ensure jobs table exists via Catalog init side effect
-        from asset_hub.catalog.db import Catalog
+        self.db_path = self.settings.jobs_db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
 
-        Catalog(self.settings)
+    def _ensure_schema(self) -> None:
+        key = str(self.db_path.resolve())
+        if key in self._initialized_paths:
+            return
+        with self._init_lock:
+            if key in self._initialized_paths:
+                return
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                conn.executescript(JOBS_SCHEMA)
+            self._migrate_legacy_jobs()
+            self._initialized_paths.add(key)
+
+    def _migrate_legacy_jobs(self) -> None:
+        legacy = self.settings.db_path
+        if not legacy.is_file() or legacy.resolve() == self.db_path.resolve():
+            return
+        with self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM app_meta WHERE key='legacy_jobs_migrated_v1'"
+            ).fetchone():
+                return
+        try:
+            uri = f"{legacy.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=10) as old:
+                exists = old.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+                ).fetchone()
+                rows = old.execute("SELECT * FROM jobs").fetchall() if exists else []
+        except sqlite3.Error:
+            rows = []
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO jobs(
+                  id,status,created_at,started_at,finished_at,filename,
+                  super_dir_name,progress_json,error,archive_path,meta_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                rows,
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key,value) VALUES('legacy_jobs_migrated_v1',?)",
+                (str(time.time()),),
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path, timeout=60)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
         try:
             yield conn
             conn.commit()
@@ -49,9 +123,17 @@ class JobStore:
         finally:
             conn.close()
 
-    def create(self, filename: str, super_dir_name: str = "", meta: dict | None = None) -> Job:
+    def create(
+        self,
+        filename: str,
+        super_dir_name: str = "",
+        meta: dict | None = None,
+        *,
+        enqueue: bool = True,
+    ) -> Job:
         job_id = uuid.uuid4().hex
         now = time.time()
+        status = "queued" if enqueue else "uploading"
         with self.connect() as conn:
             conn.execute(
                 """
@@ -60,15 +142,28 @@ class JobStore:
                 """,
                 (
                     job_id,
-                    "queued",
+                    status,
                     now,
                     filename,
                     super_dir_name,
-                    json.dumps({"percent": 0, "label": "queued"}, ensure_ascii=False),
+                    json.dumps(
+                        {"percent": 0, "label": "queued" if enqueue else "uploading"},
+                        ensure_ascii=False,
+                    ),
                     json.dumps(meta or {}, ensure_ascii=False),
                 ),
             )
         return self.get(job_id)  # type: ignore
+
+    def enqueue(self, job_id: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET status='queued', progress_json=?
+                 WHERE id=? AND status='uploading'
+                """,
+                (json.dumps({"percent": 0, "label": "queued"}, ensure_ascii=False), job_id),
+            )
 
     def get(self, job_id: str) -> Job | None:
         with self.connect() as conn:
@@ -84,26 +179,37 @@ class JobStore:
             return [self._to_job(r) for r in rows]
 
     def claim_next(self) -> Job | None:
-        job_id: str | None = None
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
-            if not row:
-                return None
-            now = time.time()
-            conn.execute(
-                "UPDATE jobs SET status='running', started_at=?, progress_json=? WHERE id=? AND status='queued'",
+                """
+                UPDATE jobs
+                   SET status='running', started_at=?, progress_json=?
+                 WHERE id=(
+                   SELECT id FROM jobs WHERE status='queued'
+                   ORDER BY created_at ASC LIMIT 1
+                 )
+                   AND status='queued'
+                RETURNING *
+                """,
                 (
-                    now,
+                    time.time(),
                     json.dumps({"percent": 1, "label": "running"}, ensure_ascii=False),
-                    row["id"],
                 ),
+            ).fetchone()
+            return self._to_job(row) if row else None
+
+    def requeue_interrupted(self) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE jobs
+                   SET status='queued', started_at=NULL, finished_at=NULL,
+                       progress_json=?, error=''
+                 WHERE status='running'
+                """,
+                (json.dumps({"percent": 0, "label": "requeued"}, ensure_ascii=False),),
             )
-            if conn.total_changes == 0:
-                return None
-            job_id = row["id"]
-        return self.get(job_id) if job_id else None
+            return int(cursor.rowcount)
 
     def update(
         self,

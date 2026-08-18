@@ -10,7 +10,7 @@ from asset_hub.catalog.ignore import should_ignore
 from asset_hub.config import ensure_data_dirs, get_settings
 
 log = logging.getLogger("asset_hub.index")
-BATCH_SIZE = 500
+BATCH_SIZE = 25
 
 
 def index_library(
@@ -23,7 +23,11 @@ def index_library(
         log.warning("library root missing: %s", root)
         return 0
     count = 0
+    changed = 0
+    skipped = 0
     batch: list[AssetRow] = []
+    existing = catalog.library_fingerprints()
+    seen: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root):
         # prune ignored dirs
         dirnames[:] = [d for d in dirnames if not should_ignore(d, ignore_globs)]
@@ -37,6 +41,29 @@ def index_library(
                 continue
             rel = path.relative_to(root).as_posix()
             asset_id = f"lib:{rel}"
+            seen.add(asset_id)
+            before = existing.get(asset_id)
+            if (
+                before
+                and not int(before["deleted"] or 0)
+                and before["status"] == "ready"
+                and before["file_name"] == name
+                and int(before["file_size"] or 0) == int(st.st_size)
+                and abs(float(before["updated_at"] or 0) - float(st.st_mtime)) < 0.000001
+                and before["local_path"] == str(path)
+                and before["virtual_path"] == rel
+            ):
+                count += 1
+                skipped += 1
+                if limit and count >= limit:
+                    log.info(
+                        "library index partial scanned=%s changed=%s skipped=%s",
+                        count,
+                        changed,
+                        skipped,
+                    )
+                    return count
+                continue
             batch.append(
                 AssetRow(
                     asset_id=asset_id,
@@ -54,15 +81,28 @@ def index_library(
                 )
             )
             count += 1
+            changed += 1
             if len(batch) >= BATCH_SIZE:
                 catalog.upsert_assets(batch)
                 batch.clear()
             if limit and count >= limit:
-                catalog.upsert_assets(batch)
+                if batch:
+                    catalog.upsert_assets(batch)
                 return count
         if count and count % 5000 == 0:
             log.info("indexed library files=%s", count)
-    catalog.upsert_assets(batch)
+    if batch:
+        catalog.upsert_assets(batch)
+    tombstoned = catalog.tombstone_library_assets(
+        sorted(set(existing) - seen), batch_size=BATCH_SIZE
+    )
+    log.info(
+        "library index scanned=%s changed=%s skipped=%s tombstoned=%s",
+        count,
+        changed,
+        skipped,
+        tombstoned,
+    )
     return count
 
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import os
 import re
+import signal
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -37,6 +40,8 @@ def _group_rows(rows: list[ExcelRow], handlers: set[str]) -> OrderedDict[str, li
 
 
 def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
+    total_started = time.perf_counter()
+    timings: dict[str, float] = {}
     settings = store.settings
     job = store.get(job_id)
     if not job:
@@ -64,10 +69,14 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 progress={"percent": 5, "label": "素材仍在同步，按当前可用内容匹配"},
             )
         store.update(job_id, progress={"percent": 10, "label": "解析 Excel"})
+        phase_started = time.perf_counter()
         rows = read_excel_rows(excel_path)
+        timings["parse_s"] = round(time.perf_counter() - phase_started, 4)
+        phase_started = time.perf_counter()
         matched, missing = match_assets_for_rows(
             catalog, rows, rule_handlers=handlers
         )
+        timings["match_s"] = round(time.perf_counter() - phase_started, 4)
         matched_by_row = {block["row"].row_index: block for block in matched}
         missing_by_row = {item["row"].row_index: item for item in missing}
         preferred_rows = sum(
@@ -92,6 +101,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             },
         )
 
+        phase_started = time.perf_counter()
         prefix = _safe_component(job.super_dir_name, "pack")
         generated_dir = job_dir / "generated"
         generated_dir.mkdir(exist_ok=True)
@@ -194,9 +204,14 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             )
             return
 
+        timings["plan_s"] = round(time.perf_counter() - phase_started, 4)
+
         store.update(job_id, progress={"percent": 60, "label": f"打包 {len(pairs)} 个文件"})
         archive = job_dir / "result.zip"
+        phase_started = time.perf_counter()
         zip_paths(pairs, archive, fast_media="fast_zip" in handlers)
+        timings["zip_s"] = round(time.perf_counter() - phase_started, 4)
+        timings["total_s"] = round(time.perf_counter() - total_started, 4)
         store.update(
             job_id,
             status="done",
@@ -209,10 +224,19 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                 "missing": len(missing),
                 "preferred_rows": preferred_rows,
                 "fallback_rows": fallback_rows,
+                "archive_bytes": archive.stat().st_size,
+                "timings": timings,
             },
             finished=True,
         )
-        log.info("job %s done files=%s rules=%s", job_id, len(pairs), sorted(handlers))
+        log.info(
+            "job %s done files=%s bytes=%s timings=%s rules=%s",
+            job_id,
+            len(pairs),
+            archive.stat().st_size,
+            timings,
+            sorted(handlers),
+        )
     except Exception as exc:
         log.exception("job failed %s", job_id)
         store.update(
@@ -224,7 +248,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         )
 
 
-def run() -> None:
+def _worker_loop(worker_id: int, stop_event=None) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -232,14 +256,81 @@ def run() -> None:
     settings = ensure_data_dirs()
     catalog = Catalog(settings)
     store = JobStore(settings)
-    log.info("worker started jobs_dir=%s", settings.jobs_dir)
-    while True:
+    log.info(
+        "worker started id=%s pid=%s jobs_dir=%s",
+        worker_id,
+        os.getpid(),
+        settings.jobs_dir,
+    )
+    while stop_event is None or not stop_event.is_set():
         job = store.claim_next()
         if not job:
-            time.sleep(1)
+            if stop_event is not None:
+                stop_event.wait(0.1)
+            else:
+                time.sleep(0.1)
             continue
-        log.info("claimed job %s", job.id)
+        log.info("worker=%s claimed job %s", worker_id, job.id)
         process_job(store, catalog, job.id)
+
+
+def run() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    settings = ensure_data_dirs()
+    store = JobStore(settings)
+    requeued = store.requeue_interrupted()
+    worker_count = max(1, int(settings.pack_workers))
+    if worker_count == 1:
+        if requeued:
+            log.warning("requeued interrupted jobs=%s", requeued)
+        _worker_loop(1)
+        return
+
+    context = multiprocessing.get_context("fork")
+    stop_event = context.Event()
+
+    def request_stop(_signum, _frame) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    processes = [
+        context.Process(
+            target=_worker_loop,
+            args=(worker_id, stop_event),
+            name=f"asset-pack-{worker_id}",
+        )
+        for worker_id in range(1, worker_count + 1)
+    ]
+    for process in processes:
+        process.start()
+    log.warning(
+        "worker pool started processes=%s requeued=%s",
+        worker_count,
+        requeued,
+    )
+    failed = False
+    try:
+        while not stop_event.is_set():
+            for process in processes:
+                process.join(timeout=0.25)
+                if process.exitcode not in (None, 0):
+                    failed = True
+                    stop_event.set()
+                    break
+    finally:
+        stop_event.set()
+        for process in processes:
+            process.join(timeout=300)
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

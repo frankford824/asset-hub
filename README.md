@@ -128,10 +128,16 @@ ticket，以发现同 key 覆盖或 OSS 删除。
 规则条目中的 `handler` 必须是服务支持的已注册处理器；CRUD 允许调整名称、说明、
 参数和启用状态，但不会执行任意用户代码。
 
-`asset-hub-index` 使用批量事务重建既有目录索引；index 与 finalized sync 通过
-`/run/asset-hub/catalog.lock` 串行写 catalog。index timer 从一次索引完成后再计时
-30 分钟，sync timer 从一次同步完成后再计时 5 分钟，避免任务耗时超过周期时
-立即补跑并长期占用 SQLite 写锁或 CPU。
+`asset-hub-index` 先比较路径、大小和修改时间，只写入新增或变化的文件；每批最多
+25 条短事务，并将真实退出目录的文件标记 tombstone。index 与 finalized sync 通过
+`/run/asset-hub/catalog.lock` 串行写 catalog。全目录兜底索引每天 03:30 执行，网页
+上传仍会实时入库；sync timer 从一次同步完成后再计时 5 分钟。
+
+打包任务使用独立的 `db/jobs.sqlite3` WAL 队列，不再与 catalog 索引争抢写锁。
+默认 4 个打包进程原子领取任务，API 默认 4 个进程、backlog 2048，并由 nginx
+`reuseport + sendfile` 承担局域网下载。系统可以稳定接收 100+ 并发请求；实际同时
+执行的打包任务受 `pack_workers` 控制，避免 100 个 ZIP 同时争抢 CPU、素材盘和
+千兆网卡。空闲页面每 5 秒刷新，存在排队/运行任务时每秒刷新。
 
 ### 内部存储
 

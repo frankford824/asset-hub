@@ -2,10 +2,9 @@
 Description=asset-hub catalog index timer
 
 [Timer]
-OnBootSec=3min
-OnUnitInactiveSec=30min
+OnCalendar=*-*-* 03:30:00
 AccuracySec=1min
-Persistent=true
+RandomizedDelaySec=5min
 Unit=asset-hub-index.service
 
 [Install]

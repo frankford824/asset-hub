@@ -273,5 +273,10 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape") { 
 (async function boot() {
   try { await Promise.all([refreshStatus(), loadRules(), loadJobs()]); }
   catch (error) { showError(error); }
-  setInterval(() => { refreshStatus().catch(() => {}); loadJobs().catch(() => {}); }, 4000);
+  const poll = async () => {
+    await Promise.all([refreshStatus().catch(() => {}), loadJobs().catch(() => {})]);
+    const busy = state.jobs.some((job) => ["uploading", "queued", "running"].includes(job.status));
+    setTimeout(poll, busy ? 1000 : 5000);
+  };
+  setTimeout(poll, 1000);
 })();
