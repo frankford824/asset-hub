@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import time
 from io import BytesIO
 from pathlib import Path
@@ -207,6 +208,21 @@ def test_index_library(settings):
     assert n == 1
     hits = Catalog(settings).search("a.jpg", kind="library")
     assert len(hits[0]) == 1
+
+
+def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
+    catalog = Catalog(settings)
+    key = str(catalog.db_path.resolve())
+    Catalog._schema_initialized_paths.discard(key)
+
+    writer = sqlite3.connect(catalog.db_path, timeout=1)
+    try:
+        writer.execute("BEGIN IMMEDIATE")
+        current = Catalog(settings)
+        assert current.get_sync_state("finalized")["ready"] is False
+    finally:
+        writer.rollback()
+        writer.close()
 
 
 def test_zip_store_for_jpg(settings, tmp_path):

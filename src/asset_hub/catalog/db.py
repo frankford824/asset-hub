@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -205,12 +206,98 @@ class AssetRow:
 
 
 class Catalog:
+    _schema_init_lock = threading.Lock()
+    _schema_initialized_paths: set[str] = set()
+
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         ensure_data_dirs(self.settings)
         self.db_path = self.settings.db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """Run migrations once and avoid writes for an already-current catalog."""
+        key = str(self.db_path.resolve())
+        if key in self._schema_initialized_paths:
+            return
+        with self._schema_init_lock:
+            if key in self._schema_initialized_paths:
+                return
+            if not self._schema_is_current():
+                self._init_schema()
+            self._schema_initialized_paths.add(key)
+
+    def _schema_is_current(self) -> bool:
+        """Check schema read-only so API startup works during a long index write."""
+        if not self.db_path.is_file():
+            return False
+        required_tables = {
+            "assets",
+            "asset_name_claims",
+            "finalized_items",
+            "sku_tokens",
+            "assets_fts",
+            "sync_state",
+            "jobs",
+            "pack_rules",
+            "app_meta",
+            "download_selections",
+        }
+        required_indexes = {
+            "idx_assets_task_asset",
+            "idx_assets_virtual_path",
+            "idx_asset_name_claim_asset",
+            "idx_pack_rules_sort",
+        }
+        required_asset_columns = {
+            "task_asset_id",
+            "crc64_ecma",
+            "format",
+            "mime_type",
+            "retryable",
+            "last_error",
+            "manifest_id",
+            "virtual_path",
+            "dedup_of_asset_id",
+        }
+        required_sync_columns = {"etag", "manifest_id", "last_verified_at"}
+        try:
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=5) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                if not required_tables.issubset(tables):
+                    return False
+                indexes = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )
+                }
+                if not required_indexes.issubset(indexes):
+                    return False
+                asset_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(assets)")
+                }
+                sync_columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(sync_state)")
+                }
+                if not required_asset_columns.issubset(asset_columns):
+                    return False
+                if not required_sync_columns.issubset(sync_columns):
+                    return False
+                return bool(
+                    conn.execute(
+                        "SELECT 1 FROM app_meta WHERE key='asset_name_claims_v1'"
+                    ).fetchone()
+                )
+        except sqlite3.Error:
+            return False
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
