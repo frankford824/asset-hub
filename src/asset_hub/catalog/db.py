@@ -477,7 +477,12 @@ class Catalog:
         )
         conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset.asset_id,))
         tokens = extract_sku_tokens(
-            asset.sku_code, asset.sku_name, asset.file_name, asset.original_filename
+            asset.sku_code,
+            asset.sku_name,
+            asset.file_name,
+            asset.original_filename,
+            asset.storage_key,
+            asset.virtual_path,
         )
         conn.executemany(
             "INSERT OR IGNORE INTO sku_tokens(token, asset_id) VALUES (?,?)",
@@ -525,6 +530,47 @@ class Catalog:
                 """
             ).fetchall()
         return {row["asset_id"]: dict(row) for row in rows}
+
+    def backfill_library_path_tokens(self, *, batch_size: int = 250) -> int:
+        """One-time backfill for SKUs stored in product directory names."""
+        marker = "library_path_tokens_v1"
+        with self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM app_meta WHERE key=?", (marker,)
+            ).fetchone():
+                return 0
+            rows = conn.execute(
+                """
+                SELECT asset_id,sku_code,sku_name,file_name,original_filename,
+                       storage_key,virtual_path
+                  FROM assets WHERE kind='library' AND deleted=0
+                """
+            ).fetchall()
+        inserted = 0
+        size = max(1, batch_size)
+        for start in range(0, len(rows), size):
+            with self.connect() as conn:
+                for row in rows[start : start + size]:
+                    tokens = extract_sku_tokens(
+                        row["sku_code"],
+                        row["sku_name"],
+                        row["file_name"],
+                        row["original_filename"],
+                        row["storage_key"],
+                        row["virtual_path"],
+                    )
+                    before = conn.total_changes
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO sku_tokens(token,asset_id) VALUES (?,?)",
+                        [(token, row["asset_id"]) for token in tokens],
+                    )
+                    inserted += conn.total_changes - before
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key,value) VALUES(?,?)",
+                (marker, str(time.time())),
+            )
+        return inserted
 
     def tombstone_library_assets(
         self, asset_ids: Sequence[str], *, batch_size: int = 25
@@ -1209,8 +1255,9 @@ class Catalog:
             base = """
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
-              JOIN asset_name_claims c ON c.asset_id=a.asset_id
+              LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id
               WHERE t.token=? AND a.deleted=0 AND a.status='ready'
+                AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
             """
             args = [token]
             if kind:
@@ -1245,9 +1292,10 @@ class Catalog:
                     fts_term = f"{match}*"
                 base = """
                   FROM assets a
-                  JOIN asset_name_claims c ON c.asset_id=a.asset_id
+                  LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id
                   JOIN assets_fts f ON f.asset_id=a.asset_id
                   WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
+                    AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
                 """
                 args2: list = [fts_term]
                 if kind:
@@ -1275,6 +1323,7 @@ class Catalog:
                     a.file_name LIKE ? OR a.original_filename LIKE ?
                     OR a.sku_code LIKE ? OR a.storage_key LIKE ?
                   )
+                  AND (a.asset_id LIKE 'lib:%' OR c.asset_id IS NOT NULL)
                 """
                 args3: list = [like, like, like, like]
                 if kind:
@@ -1282,11 +1331,11 @@ class Catalog:
                     args3.append(kind)
                 total = int(
                     conn.execute(
-                        f"SELECT COUNT(*) AS c FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where}", args3
+                        f"SELECT COUNT(*) AS c FROM assets a LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where}", args3
                     ).fetchone()["c"]
                 )
                 rows = conn.execute(
-                    f"SELECT a.* FROM assets a JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
+                    f"SELECT a.* FROM assets a LEFT JOIN asset_name_claims c ON c.asset_id=a.asset_id WHERE {where} ORDER BY {priority_order} LIMIT ? OFFSET ?",
                     [*args3, limit, offset],
                 ).fetchall()
                 return [self._row_to_asset(r) for r in rows], total

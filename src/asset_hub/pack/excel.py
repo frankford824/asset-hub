@@ -126,6 +126,29 @@ def read_excel_rows(path: Path) -> list[ExcelRow]:
     raise ValueError("仅支持 .xlsx / .xls")
 
 
+def deduplicate_rows(rows: list[ExcelRow]) -> tuple[list[ExcelRow], list[dict]]:
+    """Collapse byte-for-byte business duplicates while retaining audit lines."""
+    unique: list[ExcelRow] = []
+    duplicates: list[dict] = []
+    first_by_key: dict[tuple, ExcelRow] = {}
+    for row in rows:
+        key = (
+            row.order_id.casefold(),
+            row.sku_code.casefold(),
+            row.sku_name.casefold(),
+            int(row.quantity),
+            row.address.casefold(),
+            row.keyword.casefold(),
+        )
+        first = first_by_key.get(key)
+        if first is not None:
+            duplicates.append({"row": row, "first_row_index": first.row_index})
+            continue
+        first_by_key[key] = row
+        unique.append(row)
+    return unique, duplicates
+
+
 def match_assets_for_rows(
     catalog: Catalog,
     rows: list[ExcelRow],
@@ -146,6 +169,15 @@ def match_assets_for_rows(
         if not available and row.sku_name and row.sku_name != q:
             hits, _total = catalog.search(row.sku_name, limit=limit_per_row)
             available = [hit for hit in hits if hit.local_path and Path(hit.local_path).is_file()]
+        unique_available = []
+        seen_paths: set[str] = set()
+        for hit in available:
+            key = str(Path(hit.local_path).resolve())
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            unique_available.append(hit)
+        available = unique_available
         if "keyword_filter" in handlers and row.keyword:
             keyword = row.keyword.casefold()
             available = [

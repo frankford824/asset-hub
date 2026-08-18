@@ -15,7 +15,12 @@ from asset_hub.catalog.ignore import should_ignore
 from asset_hub.catalog.index import index_library
 from asset_hub.config import Settings, ensure_data_dirs, get_settings
 from asset_hub.jobs import JobStore
-from asset_hub.pack.excel import ExcelRow, match_assets_for_rows, read_excel_rows
+from asset_hub.pack.excel import (
+    ExcelRow,
+    deduplicate_rows,
+    match_assets_for_rows,
+    read_excel_rows,
+)
 from asset_hub.pack.ziputil import zip_paths
 from asset_hub.pack.rules import PackRuleStore
 from asset_hub.sync.provider import ManifestItem
@@ -235,6 +240,85 @@ def test_index_skips_unchanged_and_tombstones_removed(settings):
     assert asset is not None and asset.deleted == 1 and asset.status == "tombstone"
 
 
+def test_index_searches_sku_from_product_directory_with_generic_names(settings):
+    root = settings.library_root
+    product = root / "水晶标" / "HSC36004——蔡谦-常规水晶标-喜字酒杯款-直径45cm"
+    other = root / "水晶标" / "HSC33778——叶真-常规水晶标-大红喜字款-直径45cm"
+    product.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (product / "第一张【25x35cm】.jpg").write_bytes(b"one")
+    (product / "第二张【25x35cm】.jpg").write_bytes(b"two")
+    (other / "第一张【25x35cm】.jpg").write_bytes(b"other")
+
+    catalog = Catalog(settings)
+    assert index_library(catalog, root, settings.sync.ignore_globs) == 3
+    hits, total = catalog.search("HSC36004", limit=20)
+    assert total == 2
+    assert {hit.file_name for hit in hits} == {
+        "第一张【25x35cm】.jpg",
+        "第二张【25x35cm】.jpg",
+    }
+
+
+def test_pack_preserves_product_names_groups_multi_image_and_merges_duplicates(settings):
+    root = settings.library_root
+    product_name = "HSC36004——蔡谦-常规水晶标-喜字酒杯款-直径45cm"
+    product = root / "水晶标" / product_name
+    product.mkdir(parents=True)
+    (product / "第一张【25x35cm】.jpg").write_bytes(b"one")
+    (product / "第二张【25x35cm】.jpg").write_bytes(b"two")
+    single_name = "HSC32845——鹏-常规KT板-波西和皮普-戴帽老鼠手拿气球【55x38cm】.jpg"
+    (root / single_name).write_bytes(b"single")
+    catalog = Catalog(settings)
+    index_library(catalog, root, settings.sync.ignore_globs)
+
+    xlsx = settings.tmp_dir / "names.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["编码"])
+    sheet.append(["HSC36004"])
+    sheet.append(["HSC36004"])
+    sheet.append(["HSC32845"])
+    workbook.save(xlsx)
+    parsed = read_excel_rows(xlsx)
+    unique, duplicates = deduplicate_rows(parsed)
+    assert len(parsed) == 3 and len(unique) == 2 and len(duplicates) == 1
+
+    rules = [
+        {"name": "库内素材兜底", "handler": "library_fallback"},
+        {"name": "保留商品名称与尺寸", "handler": "rename_sku_sequence"},
+        {"name": "生成缺失清单", "handler": "missing_report"},
+        {"name": "生成选择说明", "handler": "selection_report"},
+        {"name": "媒体文件快速打包", "handler": "fast_zip"},
+    ]
+    store = JobStore(settings)
+    job = store.create(filename="names.xlsx", super_dir_name="pack", meta={"rules": rules})
+    job_dir = store.job_dir(job.id)
+    (job_dir / "input.xlsx").write_bytes(xlsx.read_bytes())
+    claimed = store.claim_next()
+    assert claimed is not None
+    from asset_hub.worker.main import process_job
+
+    process_job(store, catalog, claimed.id)
+    done = store.get(claimed.id)
+    assert done is not None and done.status == "done"
+    import zipfile
+
+    with zipfile.ZipFile(done.archive_path) as archive:
+        names = archive.namelist()
+        assert f"pack/{product_name}/第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}/第二张【25x35cm】.jpg" in names
+        assert f"pack/{single_name}" in names
+        assert not any("HSC36004_1" in name or "HSC36004_2" in name for name in names)
+        report = archive.read("pack/素材选择说明.txt").decode("utf-8")
+        assert "输入编码行：3" in report
+        assert "唯一业务行：2" in report
+        assert "与第 2 行重复，已合并" in report
+    assert done.progress["input_rows"] == 3
+    assert done.progress["unique_rows"] == 2
+    assert done.progress["duplicate_rows"] == 1
+
+
 def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
     catalog = Catalog(settings)
     key = str(catalog.db_path.resolve())
@@ -425,6 +509,8 @@ def test_create_job_allows_library_fallback_before_sync_complete(settings):
     )
     assert response.status_code == 200
     assert response.json()["job_id"]
+    assert response.json()["input_rows"] == 1
+    assert response.json()["unique_rows"] == 1
 
 
 def test_library_upload_tree_and_global_filename_dedupe(settings):

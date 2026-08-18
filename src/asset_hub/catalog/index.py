@@ -22,6 +22,9 @@ def index_library(
     if not root.is_dir():
         log.warning("library root missing: %s", root)
         return 0
+    token_backfill = catalog.backfill_library_path_tokens()
+    if token_backfill:
+        log.info("library path SKU token backfill inserted=%s", token_backfill)
     count = 0
     changed = 0
     skipped = 0

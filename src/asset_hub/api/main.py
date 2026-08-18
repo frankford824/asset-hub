@@ -20,6 +20,7 @@ from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path
 from asset_hub.config import ensure_data_dirs, get_settings
 from asset_hub.jobs import JobStore
 from asset_hub.pack.rules import PackRuleStore, SUPPORTED_HANDLERS
+from asset_hub.pack.excel import deduplicate_rows, read_excel_rows
 from asset_hub.pack.ziputil import zip_paths
 
 
@@ -542,29 +543,59 @@ def create_job(
         rules = PackRuleStore(s).snapshots(selected_ids)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    store = JobStore(s)
-    job = store.create(
-        filename=file.filename or f"input{suffix}",
-        super_dir_name=super_dir_name,
-        meta={"rules": rules},
-        enqueue=False,
-    )
-    job_dir = store.job_dir(job.id)
-    dest = job_dir / f"input{suffix}"
+    incoming = s.tmp_dir / f"incoming-{uuid.uuid4().hex}{suffix}"
     try:
-        with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        store.enqueue(job.id)
-    except Exception as exc:
-        store.update(
-            job.id,
-            status="failed",
-            error=str(exc),
-            progress={"percent": 0, "label": "upload failed"},
-            finished=True,
+        with incoming.open("wb") as output:
+            shutil.copyfileobj(file.file, output)
+        try:
+            input_rows = read_excel_rows(incoming)
+        except Exception as exc:
+            raise HTTPException(400, f"Excel 无法解析：{exc}") from exc
+        if not input_rows:
+            raise HTTPException(400, "Excel 中没有可处理的编码行")
+        unique_rows, duplicate_rows = deduplicate_rows(input_rows)
+        duplicate_codes = list(
+            dict.fromkeys(
+                item["row"].sku_code or item["row"].sku_name
+                for item in duplicate_rows
+            )
         )
+        store = JobStore(s)
+        job = store.create(
+            filename=file.filename or f"input{suffix}",
+            super_dir_name=super_dir_name,
+            meta={
+                "rules": rules,
+                "input_rows": len(input_rows),
+                "unique_rows": len(unique_rows),
+                "duplicate_codes": duplicate_codes,
+            },
+            enqueue=False,
+        )
+        job_dir = store.job_dir(job.id)
+        dest = job_dir / f"input{suffix}"
+        incoming.replace(dest)
+        store.enqueue(job.id)
+    except HTTPException:
+        incoming.unlink(missing_ok=True)
         raise
-    return {"job_id": job.id}
+    except Exception as exc:
+        incoming.unlink(missing_ok=True)
+        if "store" in locals() and "job" in locals():
+            store.update(
+                job.id,
+                status="failed",
+                error=str(exc),
+                progress={"percent": 0, "label": "upload failed"},
+                finished=True,
+            )
+        raise
+    return {
+        "job_id": job.id,
+        "input_rows": len(input_rows),
+        "unique_rows": len(unique_rows),
+        "duplicate_codes": duplicate_codes,
+    }
 
 
 @app.get("/api/v1/jobs/{job_id}")

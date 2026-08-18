@@ -130,7 +130,7 @@ async function submitPack(event) {
   event.preventDefault(); const file = $("#excel").files[0]; if (!file) return;
   const form = new FormData(); form.append("file", file); form.append("super_dir_name", $("#super").value.trim()); form.append("rule_ids", JSON.stringify([...state.selectedRules]));
   $("#pack-submit").disabled = true; $("#pack-submit").textContent = "正在提交…"; $("#pack-msg").hidden = true;
-  try { await api("/api/v1/jobs", { method: "POST", body: form }); $("#excel").value = ""; $("#excel-label").textContent = "拖入订单 Excel，或点击选择"; await loadJobs(); toast("打包任务已提交"); }
+  try { const result = await api("/api/v1/jobs", { method: "POST", body: form }); $("#excel").value = ""; $("#excel-label").textContent = "拖入订单 Excel，或点击选择"; await loadJobs(); const duplicate = result.duplicate_codes?.length ? `，合并 ${result.duplicate_codes.length} 个重复编码` : ""; toast(`已收到 ${result.input_rows} 行，按 ${result.unique_rows} 个唯一业务行打包${duplicate}`); }
   catch (error) { $("#pack-msg").hidden = false; $("#pack-msg").className = "form-message err"; $("#pack-msg").textContent = error.message; }
   finally { $("#pack-submit").disabled = false; $("#pack-submit").textContent = "提交打包"; }
 }
