@@ -5,7 +5,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 import httpx
@@ -15,6 +15,8 @@ from asset_hub.config import Settings
 
 MANIFEST_PATH = "/v1/integration/asset-sync/finalized/manifest"
 TICKETS_PATH = "/v1/integration/asset-sync/finalized/download-tickets"
+EXTERNAL_MANIFEST_PATH = "/v1/integration/asset-sync/external-current/manifest"
+EXTERNAL_TICKETS_PATH = "/v1/integration/asset-sync/external-current/download-tickets"
 
 
 def _timestamp(value: object) -> float:
@@ -89,10 +91,61 @@ class DownloadTicket:
     mock_seed: str = ""
 
 
+@dataclass(frozen=True)
+class ExternalManifestItem:
+    external_asset_id: int
+    origin_path_hash: str
+    relative_path: str
+    file_name: str
+    mime_type: str
+    file_size: int
+    storage_key: str
+    source_modified_at: float
+    record_updated_at: float
+    deleted: bool
+
+
+@dataclass(frozen=True)
+class ExternalManifestResult:
+    items: list[ExternalManifestItem] = field(default_factory=list)
+    manifest_id: str = ""
+    etag: str = ""
+    generated_at: float = 0.0
+    active_count: int = 0
+    deleted_count: int = 0
+    not_modified: bool = False
+
+
+@dataclass(frozen=True)
+class ExternalDownloadTicket:
+    external_asset_id: int
+    status: str
+    origin_path_hash: str = ""
+    relative_path: str = ""
+    file_name: str = ""
+    storage_key: str = ""
+    expected_size: int | None = None
+    actual_size: int | None = None
+    etag: str = ""
+    crc64_ecma: str = ""
+    whole_hash: str = ""
+    download_url: str = ""
+    expires_at: float = 0.0
+    retryable: bool = False
+    error_message: str = ""
+    mock_seed: str = ""
+
+
 class SyncProvider(Protocol):
     def get_manifest(self, etag: str = "") -> ManifestResult: ...
 
     def get_download_tickets(self, task_asset_ids: list[int]) -> list[DownloadTicket]: ...
+
+    def get_external_manifest(self, etag: str = "") -> ExternalManifestResult: ...
+
+    def get_external_download_tickets(
+        self, external_asset_ids: list[int]
+    ) -> list[ExternalDownloadTicket]: ...
 
 
 class MockProvider:
@@ -199,6 +252,23 @@ class MockProvider:
                 )
             )
         return results
+
+    def get_external_manifest(self, etag: str = "") -> ExternalManifestResult:
+        manifest_id = hashlib.sha256(b"asset-hub-mock:external-current").hexdigest()
+        response_etag = f'W/"{manifest_id}"'
+        return ExternalManifestResult(
+            manifest_id=manifest_id,
+            etag=response_etag,
+            not_modified=bool(etag and _etag_manifest_id(etag) == manifest_id),
+        )
+
+    def get_external_download_tickets(
+        self, external_asset_ids: list[int]
+    ) -> list[ExternalDownloadTicket]:
+        return [
+            ExternalDownloadTicket(external_asset_id=value, status="not_current")
+            for value in dict.fromkeys(external_asset_ids)
+        ]
 
 
 def _random_bytes(size: int) -> bytes:
@@ -346,6 +416,139 @@ class HttpProvider:
                     etag=str(item.get("etag") or ""),
                     crc64_ecma=str(item.get("crc64_ecma") or ""),
                     whole_hash=str(item.get("whole_hash") or ""),
+                    download_url=str(item.get("download_url") or ""),
+                    expires_at=_timestamp(item.get("expires_at")),
+                    retryable=bool(item.get("retryable")),
+                    error_message=str(item.get("error_message") or ""),
+                )
+            )
+        return results
+
+    def get_external_manifest(self, etag: str = "") -> ExternalManifestResult:
+        headers = {"If-None-Match": etag} if etag else {}
+        response = self._client.get(EXTERNAL_MANIFEST_PATH, headers=headers)
+        if response.status_code == 304:
+            if not etag:
+                raise ValueError("external manifest returned 304 without a local ETag")
+            return ExternalManifestResult(
+                manifest_id=_etag_manifest_id(etag),
+                etag=response.headers.get("ETag") or etag,
+                not_modified=True,
+            )
+        response.raise_for_status()
+        raw = _response_data(response)
+        if int(raw.get("schema_version") or 0) != 1:
+            raise ValueError(
+                f"unsupported external manifest schema_version={raw.get('schema_version')!r}"
+            )
+        manifest_id = str(raw.get("manifest_id") or "").strip()
+        if not manifest_id:
+            raise ValueError("external manifest_id is required")
+        response_etag = response.headers.get("ETag") or f'W/"{manifest_id}"'
+        if _etag_manifest_id(response_etag) != manifest_id:
+            raise ValueError("external manifest ETag does not match manifest_id")
+        items: list[ExternalManifestItem] = []
+        ids: set[int] = set()
+        paths: set[str] = set()
+        active_count = 0
+        deleted_count = 0
+        total_bytes = 0
+        for raw_item in raw.get("items") or []:
+            external_asset_id = int(raw_item.get("external_asset_id") or 0)
+            relative_path = str(raw_item.get("relative_path") or "").strip()
+            file_name = str(raw_item.get("file_name") or "").strip()
+            file_size = int(raw_item.get("file_size") or 0)
+            storage_key = str(raw_item.get("storage_key") or "").strip()
+            deleted = bool(raw_item.get("deleted"))
+            path_value = PurePosixPath(relative_path)
+            if (
+                external_asset_id <= 0
+                or not relative_path
+                or path_value.is_absolute()
+                or ".." in path_value.parts
+                or not file_name
+                or file_size < 0
+            ):
+                raise ValueError(f"invalid external manifest item={external_asset_id}")
+            if external_asset_id in ids or relative_path in paths:
+                raise ValueError("external manifest IDs and relative paths must be unique")
+            if deleted and storage_key:
+                raise ValueError("deleted external manifest item carries storage_key")
+            if not deleted and not storage_key:
+                raise ValueError("active external manifest item is missing storage_key")
+            ids.add(external_asset_id)
+            paths.add(relative_path)
+            if deleted:
+                deleted_count += 1
+            else:
+                active_count += 1
+                total_bytes += file_size
+            items.append(
+                ExternalManifestItem(
+                    external_asset_id=external_asset_id,
+                    origin_path_hash=str(raw_item.get("origin_path_hash") or ""),
+                    relative_path=relative_path,
+                    file_name=file_name,
+                    mime_type=str(raw_item.get("mime_type") or ""),
+                    file_size=file_size,
+                    storage_key=storage_key,
+                    source_modified_at=_timestamp(raw_item.get("source_modified_at")),
+                    record_updated_at=_timestamp(raw_item.get("record_updated_at")),
+                    deleted=deleted,
+                )
+            )
+        if int(raw.get("item_count") or 0) != len(items):
+            raise ValueError("external manifest item_count does not match items")
+        if int(raw.get("active_count") or 0) != active_count:
+            raise ValueError("external manifest active_count does not match items")
+        if int(raw.get("deleted_count") or 0) != deleted_count:
+            raise ValueError("external manifest deleted_count does not match items")
+        if int(raw.get("total_object_bytes") or 0) != total_bytes:
+            raise ValueError("external manifest total_object_bytes does not match items")
+        return ExternalManifestResult(
+            items=items,
+            manifest_id=manifest_id,
+            etag=response_etag,
+            generated_at=_timestamp(raw.get("generated_at")),
+            active_count=active_count,
+            deleted_count=deleted_count,
+        )
+
+    def get_external_download_tickets(
+        self, external_asset_ids: list[int]
+    ) -> list[ExternalDownloadTicket]:
+        ids = list(dict.fromkeys(external_asset_ids))
+        if not 1 <= len(ids) <= 50:
+            raise ValueError("external_asset_ids must contain between 1 and 50 items")
+        response = self._client.post(
+            EXTERNAL_TICKETS_PATH, json={"external_asset_ids": ids}
+        )
+        response.raise_for_status()
+        raw = _response_data(response)
+        results: list[ExternalDownloadTicket] = []
+        seen: set[int] = set()
+        for item in raw.get("results") or []:
+            external_asset_id = int(item.get("external_asset_id") or 0)
+            if external_asset_id in seen:
+                raise ValueError(
+                    f"duplicate external ticket external_asset_id={external_asset_id}"
+                )
+            seen.add(external_asset_id)
+            status = str(item.get("status") or "")
+            if status not in {"ready", "missing", "size_mismatch", "not_current", "error"}:
+                raise ValueError(f"unknown external ticket status={status!r}")
+            results.append(
+                ExternalDownloadTicket(
+                    external_asset_id=external_asset_id,
+                    status=status,
+                    origin_path_hash=str(item.get("origin_path_hash") or ""),
+                    relative_path=str(item.get("relative_path") or ""),
+                    file_name=str(item.get("file_name") or ""),
+                    storage_key=str(item.get("storage_key") or ""),
+                    expected_size=_optional_int(item.get("expected_size")),
+                    actual_size=_optional_int(item.get("actual_size")),
+                    etag=str(item.get("etag") or ""),
+                    crc64_ecma=str(item.get("crc64_ecma") or ""),
                     download_url=str(item.get("download_url") or ""),
                     expires_at=_timestamp(item.get("expires_at")),
                     retryable=bool(item.get("retryable")),

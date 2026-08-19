@@ -23,7 +23,7 @@ PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS assets (
   asset_id TEXT PRIMARY KEY,
   task_asset_id INTEGER,
-  kind TEXT NOT NULL,                 -- finalized | library | archive
+  kind TEXT NOT NULL,                 -- finalized | external | library | archive
   storage_key TEXT NOT NULL DEFAULT '',
   file_name TEXT NOT NULL DEFAULT '',
   original_filename TEXT NOT NULL DEFAULT '',
@@ -369,7 +369,7 @@ class Catalog:
             """
             SELECT asset_id, file_name, local_path FROM assets
              WHERE deleted=0 AND status='ready' AND file_name<>''
-             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'library' THEN 1 ELSE 2 END,
+             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'external' THEN 1 WHEN 'library' THEN 2 ELSE 3 END,
                       updated_at DESC, asset_id
             """
         ).fetchall()
@@ -717,7 +717,7 @@ class Catalog:
             SELECT asset_id, file_name, local_path FROM assets
              WHERE deleted=0 AND status='ready' AND file_name<>''
                AND file_name=? COLLATE NOCASE
-             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'library' THEN 1 ELSE 2 END,
+             ORDER BY CASE kind WHEN 'finalized' THEN 0 WHEN 'external' THEN 1 WHEN 'library' THEN 2 ELSE 3 END,
                       updated_at DESC, asset_id
             """,
             (file_name,),
@@ -989,6 +989,124 @@ class Catalog:
                 "unchanged_items": unchanged_items,
             }
 
+    def apply_external_manifest(
+        self, items: Sequence[Any], manifest_id: str
+    ) -> dict[str, int]:
+        """Apply the current external overlay without deleting retained files."""
+        active = deleted = pending = reused = 0
+        seen: set[str] = set()
+        with self.connect() as conn:
+            existing = {
+                row["asset_id"]: row
+                for row in conn.execute(
+                    "SELECT * FROM assets WHERE kind='external'"
+                ).fetchall()
+            }
+            for item in items:
+                asset_id = f"external:{int(item.external_asset_id)}"
+                if asset_id in seen:
+                    raise ValueError(f"duplicate external asset {asset_id}")
+                seen.add(asset_id)
+                relative_path = normalize_virtual_path(item.relative_path)
+                library_root = self.settings.library_root.resolve()
+                destination = (library_root / relative_path).resolve()
+                if destination == library_root or library_root not in destination.parents:
+                    raise ValueError(
+                        f"external relative_path escapes library root: {relative_path}"
+                    )
+                timestamp = float(
+                    item.source_modified_at or item.record_updated_at or 0
+                )
+                previous = existing.get(asset_id)
+                is_deleted = bool(item.deleted)
+                metadata_changed = bool(
+                    previous
+                    and (
+                        previous["storage_key"] != item.storage_key
+                        or int(previous["file_size"] or 0) != int(item.file_size)
+                        or abs(float(previous["updated_at"] or 0) - timestamp)
+                        > 0.001
+                    )
+                )
+                local_valid = False
+                if not is_deleted and destination.is_file():
+                    stat = destination.stat()
+                    local_valid = stat.st_size == int(item.file_size)
+                    # First adoption reuses the already-migrated local mirror by
+                    # path+size. Once an external row exists, every upstream
+                    # fingerprint/storage/size change forces a fresh ticket and
+                    # atomic download, including same-size replacements.
+                    if metadata_changed:
+                        local_valid = False
+                status = (
+                    "tombstone"
+                    if is_deleted
+                    else ("ready" if local_valid else "pending")
+                )
+                self._upsert_asset(
+                    conn,
+                    AssetRow(
+                        asset_id=asset_id,
+                        kind="external",
+                        storage_key="" if is_deleted else item.storage_key,
+                        file_name=item.file_name,
+                        original_filename=item.file_name,
+                        file_size=int(item.file_size),
+                        format=Path(item.file_name).suffix.lower().lstrip("."),
+                        mime_type=item.mime_type,
+                        local_path=str(destination),
+                        status=status,
+                        updated_at=timestamp,
+                        deleted=int(is_deleted),
+                        manifest_id=manifest_id,
+                        virtual_path=relative_path,
+                    ),
+                    timestamp or time.time(),
+                )
+                if is_deleted:
+                    deleted += 1
+                    conn.execute(
+                        "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
+                    )
+                else:
+                    active += 1
+                    reused += int(local_valid)
+                    pending += int(not local_valid)
+                    if metadata_changed:
+                        conn.execute(
+                            "UPDATE assets SET etag='',crc64_ecma='' WHERE asset_id=?",
+                            (asset_id,),
+                        )
+            exited = 0
+            for asset_id, previous in existing.items():
+                if asset_id in seen or int(previous["deleted"] or 0):
+                    continue
+                conn.execute(
+                    "UPDATE assets SET deleted=1,status='tombstone',retryable=0,last_error='manifest_exit',manifest_id=? WHERE asset_id=?",
+                    (manifest_id, asset_id),
+                )
+                conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
+                conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
+                conn.execute(
+                    "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
+                )
+                exited += 1
+        return {
+            "items": len(seen),
+            "active": active,
+            "deleted": deleted,
+            "pending": pending,
+            "reused": reused,
+            "exited": exited,
+        }
+
+    def list_external_assets(self) -> list[AssetRow]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM assets WHERE kind='external' AND deleted=0 ORDER BY asset_id"
+            ).fetchall()
+            return [self._row_to_asset(row) for row in rows]
+
     def list_finalized_assets(self) -> list[AssetRow]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -1019,9 +1137,17 @@ class Catalog:
             return self._row_to_asset(row) if row else None
 
     def ticket_candidates(
-        self, *, verify_all: bool = False, include_nonready: bool = False
+        self,
+        *,
+        kind: str = "finalized",
+        verify_all: bool = False,
+        include_nonready: bool = False,
     ) -> list[AssetRow]:
-        rows = self.list_finalized_assets()
+        rows = (
+            self.list_finalized_assets()
+            if kind == "finalized"
+            else self.list_external_assets()
+        )
         candidates: list[AssetRow] = []
         for row in rows:
             local_valid = bool(
@@ -1039,6 +1165,55 @@ class Catalog:
             ):
                 candidates.append(row)
         return candidates
+
+    def mark_asset_status(
+        self,
+        asset_id: str,
+        status: str,
+        *,
+        local_path: str | None = None,
+        etag: str | None = None,
+        crc64_ecma: str | None = None,
+        retryable: bool = False,
+        error: str = "",
+    ) -> None:
+        fields = ["status=?", "retryable=?", "last_error=?"]
+        values: list[Any] = [status, int(retryable), error]
+        for name, value in (
+            ("local_path", local_path),
+            ("etag", etag),
+            ("crc64_ecma", crc64_ecma),
+        ):
+            if value is not None:
+                fields.append(f"{name}=?")
+                values.append(value)
+        values.append(asset_id)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE assets SET {', '.join(fields)} WHERE asset_id=?", values
+            )
+            if status == "ready":
+                row = conn.execute(
+                    "SELECT file_name,local_path FROM assets WHERE asset_id=?",
+                    (asset_id,),
+                ).fetchone()
+                if row and row["local_path"] and Path(row["local_path"]).is_file():
+                    name_key = normalize_file_name(row["file_name"])
+                    if name_key:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO asset_name_claims(normalized_name,asset_id,claimed_at) VALUES (?,?,?)",
+                            (name_key, asset_id, time.time()),
+                        )
+
+    def mark_asset_tombstone(self, asset_id: str, reason: str = "not_current") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE assets SET deleted=1,status='tombstone',retryable=0,last_error=? WHERE asset_id=?",
+                (reason, asset_id),
+            )
+            conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
+            conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
+            conn.execute("DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,))
 
     def mark_task_asset_status(
         self,
@@ -1123,6 +1298,18 @@ class Catalog:
                 return False
         return True
 
+    def external_cache_complete(self, manifest_id: str) -> bool:
+        state = self.get_sync_state("external")
+        if not manifest_id or state.get("manifest_id") != manifest_id:
+            return False
+        for asset in self.list_external_assets():
+            if asset.status != "ready" or not asset.local_path:
+                return False
+            path = Path(asset.local_path)
+            if not path.is_file() or path.stat().st_size != asset.file_size:
+                return False
+        return True
+
     def list_directory(
         self,
         virtual_path: str = "",
@@ -1142,6 +1329,10 @@ class Catalog:
                 SELECT a.* FROM asset_name_claims c
                 JOIN assets a ON a.asset_id=c.asset_id
                 WHERE a.deleted=0 AND a.status='ready' AND a.virtual_path LIKE ?
+                  AND NOT (a.kind='library' AND EXISTS (
+                    SELECT 1 FROM assets e
+                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                  ))
                 ORDER BY a.virtual_path COLLATE NOCASE, a.asset_id
                 """,
                 (prefix + "%",),
@@ -1192,16 +1383,21 @@ class Catalog:
         priority_order = """
           CASE a.kind
             WHEN 'finalized' THEN 0
-            WHEN 'library' THEN 1
-            WHEN 'archive' THEN 2
-            ELSE 3
+            WHEN 'external' THEN 1
+            WHEN 'library' THEN 2
+            WHEN 'archive' THEN 3
+            ELSE 4
           END,
           a.updated_at DESC,
           a.asset_id ASC
         """
         with self.connect() as conn:
             if not q:
-                where = "a.deleted=0 AND a.status='ready'"
+                where = """a.deleted=0 AND a.status='ready'
+                  AND NOT (a.kind='library' AND EXISTS (
+                    SELECT 1 FROM assets e
+                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                  ))"""
                 args: list = []
                 if kind:
                     where += " AND a.kind=?"
@@ -1226,6 +1422,10 @@ class Catalog:
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
               WHERE t.token=? AND a.deleted=0 AND a.status='ready'
+                AND NOT (a.kind='library' AND EXISTS (
+                  SELECT 1 FROM assets e
+                   WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                ))
             """
             args = [token]
             if kind:
@@ -1237,9 +1437,10 @@ class Catalog:
                     f"""SELECT a.* {base}
                     ORDER BY CASE a.kind
                       WHEN 'finalized' THEN 0
-                      WHEN 'library' THEN 1
-                      WHEN 'archive' THEN 2
-                      ELSE 3 END,
+                      WHEN 'external' THEN 1
+                      WHEN 'library' THEN 2
+                      WHEN 'archive' THEN 3
+                      ELSE 4 END,
                       a.updated_at DESC, a.asset_id ASC
                     LIMIT ? OFFSET ?""",
                     [*args, limit, offset],
@@ -1262,6 +1463,10 @@ class Catalog:
                   FROM assets a
                   JOIN assets_fts f ON f.asset_id=a.asset_id
                   WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
+                    AND NOT (a.kind='library' AND EXISTS (
+                      SELECT 1 FROM assets e
+                       WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                    ))
                 """
                 args2: list = [fts_term]
                 if kind:
@@ -1274,9 +1479,10 @@ class Catalog:
                     f"""SELECT a.* {base}
                     ORDER BY CASE a.kind
                       WHEN 'finalized' THEN 0
-                      WHEN 'library' THEN 1
-                      WHEN 'archive' THEN 2
-                      ELSE 3 END,
+                      WHEN 'external' THEN 1
+                      WHEN 'library' THEN 2
+                      WHEN 'archive' THEN 3
+                      ELSE 4 END,
                       a.updated_at DESC, a.asset_id ASC
                     LIMIT ? OFFSET ?""",
                     [*args2, limit, offset],
@@ -1285,7 +1491,11 @@ class Catalog:
             except sqlite3.OperationalError:
                 like = f"%{q}%"
                 where = """
-                  a.deleted=0 AND a.status='ready' AND (
+                  a.deleted=0 AND a.status='ready'
+                  AND NOT (a.kind='library' AND EXISTS (
+                    SELECT 1 FROM assets e
+                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                  )) AND (
                     a.file_name LIKE ? OR a.original_filename LIKE ?
                     OR a.sku_code LIKE ? OR a.storage_key LIKE ?
                   )

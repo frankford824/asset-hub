@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -14,6 +15,7 @@ from asset_hub.catalog.ignore import should_ignore
 from asset_hub.config import ensure_data_dirs, get_settings
 from asset_hub.sync.provider import (
     DownloadTicket,
+    ExternalDownloadTicket,
     SyncProvider,
     build_provider,
     copy_mock_ticket,
@@ -225,7 +227,9 @@ def sync_once(provider: SyncProvider | None = None) -> dict:
         "tombstone": 0,
         "ready_for_pack": False,
     }
-    unsupported_kinds = [kind for kind in settings.sync.kinds if kind != "finalized"]
+    unsupported_kinds = [
+        kind for kind in settings.sync.kinds if kind not in {"finalized", "external"}
+    ]
     if unsupported_kinds:
         message = (
             "manifest/ticket provider only supports finalized; unsupported sync kinds: "
@@ -386,6 +390,258 @@ def sync_once(provider: SyncProvider | None = None) -> dict:
     return stats
 
 
+def _process_external_ticket(
+    catalog: Catalog,
+    asset: AssetRow,
+    ticket: ExternalDownloadTicket,
+    settings,
+    stats: dict,
+) -> bool:
+    external_asset_id = int(asset.asset_id.split(":", 1)[1])
+    if ticket.external_asset_id != external_asset_id:
+        catalog.mark_asset_status(
+            asset.asset_id,
+            "error",
+            retryable=False,
+            error="ticket external_asset_id mismatch",
+        )
+        stats["error"] += 1
+        return False
+    if ticket.status == "not_current":
+        catalog.mark_asset_tombstone(asset.asset_id)
+        stats["not_current"] += 1
+        stats["tombstone"] += 1
+        return False
+    if ticket.status == "missing":
+        catalog.mark_asset_status(
+            asset.asset_id, "missing", retryable=False, error="OSS object missing"
+        )
+        stats["missing"] += 1
+        return False
+    if ticket.status == "size_mismatch":
+        catalog.mark_asset_status(
+            asset.asset_id,
+            "size_mismatch",
+            etag=ticket.etag,
+            crc64_ecma=ticket.crc64_ecma,
+            retryable=False,
+            error=(
+                f"OSS size mismatch expected={ticket.expected_size} "
+                f"actual={ticket.actual_size}"
+            ),
+        )
+        stats["size_mismatch"] += 1
+        return False
+    if ticket.status == "error":
+        catalog.mark_asset_status(
+            asset.asset_id,
+            "error",
+            retryable=ticket.retryable,
+            error=ticket.error_message or "upstream ticket error",
+        )
+        stats["error"] += 1
+        stats["retryable_error"] += int(ticket.retryable)
+        return False
+    try:
+        if (
+            ticket.storage_key != asset.storage_key
+            or ticket.relative_path != asset.virtual_path
+            or ticket.expected_size != asset.file_size
+            or ticket.actual_size != asset.file_size
+            or not ticket.download_url
+        ):
+            raise ValueError("external ready ticket differs from manifest")
+        if _ticket_matches_local(asset, ticket):
+            destination = Path(asset.local_path)
+            stats["skipped"] += 1
+        else:
+            destination = Path(asset.local_path)
+            _download_ready_ticket(destination, asset, ticket, settings)
+            if asset.updated_at:
+                os.utime(destination, (asset.updated_at, asset.updated_at))
+            stats["written"] += 1
+        catalog.mark_asset_status(
+            asset.asset_id,
+            "ready",
+            local_path=str(destination),
+            etag=ticket.etag,
+            crc64_ecma=ticket.crc64_ecma,
+            retryable=False,
+            error="",
+        )
+        stats["ready"] += 1
+        return True
+    except Exception as exc:
+        catalog.mark_asset_status(
+            asset.asset_id, "error", retryable=True, error=str(exc)
+        )
+        stats["error"] += 1
+        stats["retryable_error"] += 1
+        log.exception("external download failed external_asset_id=%s", external_asset_id)
+        return False
+
+
+def sync_external_once(provider: SyncProvider | None = None) -> dict:
+    settings = ensure_data_dirs()
+    catalog = Catalog(settings)
+    state = catalog.get_sync_state("external")
+    stats = {
+        "manifest_modified": False,
+        "manifest_items": 0,
+        "active": 0,
+        "deleted": 0,
+        "reused": 0,
+        "requested": 0,
+        "ready": 0,
+        "written": 0,
+        "skipped": 0,
+        "missing": 0,
+        "size_mismatch": 0,
+        "not_current": 0,
+        "error": 0,
+        "retryable_error": 0,
+        "tombstone": 0,
+        "sync_complete": False,
+    }
+    try:
+        provider = provider or build_provider(settings)
+        manifest = provider.get_external_manifest(str(state.get("etag") or ""))
+    except Exception as exc:
+        stats["error"] = 1
+        catalog.set_sync_state(
+            "external",
+            ready=False,
+            error=str(exc),
+            stats_json=json.dumps(stats, ensure_ascii=False),
+        )
+        log.exception("external manifest request failed")
+        return stats
+
+    manifest_changed = not manifest.not_modified
+    if manifest_changed:
+        try:
+            filtered_items = [
+                item
+                for item in manifest.items
+                if not should_ignore(item.file_name, settings.sync.ignore_globs)
+            ]
+            snapshot = catalog.apply_external_manifest(
+                filtered_items, manifest.manifest_id
+            )
+        except Exception as exc:
+            stats["error"] = 1
+            catalog.set_sync_state(
+                "external",
+                etag="",
+                ready=False,
+                error=str(exc),
+                stats_json=json.dumps(stats, ensure_ascii=False),
+            )
+            log.exception("external manifest apply failed")
+            return stats
+        stats["manifest_modified"] = True
+        stats["manifest_items"] = snapshot["items"]
+        stats["active"] = snapshot["active"]
+        stats["deleted"] = snapshot["deleted"]
+        stats["reused"] = snapshot["reused"]
+        stats["tombstone"] = snapshot["deleted"] + snapshot["exited"]
+        state_etag = manifest.etag
+        manifest_id = manifest.manifest_id
+        catalog.set_sync_state(
+            "external",
+            etag=state_etag,
+            manifest_id=manifest_id,
+            ready=False,
+            error="",
+        )
+    else:
+        state_etag = manifest.etag or str(state.get("etag") or "")
+        manifest_id = str(state.get("manifest_id") or manifest.manifest_id or "")
+        if not manifest_id:
+            stats["error"] = 1
+            catalog.set_sync_state(
+                "external",
+                ready=False,
+                etag="",
+                error="304 received without saved external manifest state",
+                stats_json=json.dumps(stats, ensure_ascii=False),
+            )
+            return stats
+        stats["active"] = len(catalog.list_external_assets())
+        stats["manifest_items"] = stats["active"]
+
+    last_verified = float(state.get("last_verified_at") or 0)
+    verify_due = bool(last_verified) and (
+        time.time() - last_verified >= settings.sync.verify_interval_sec
+    )
+    candidates = catalog.ticket_candidates(
+        kind="external", verify_all=verify_due, include_nonready=manifest_changed
+    )
+    stats["requested"] = len(candidates)
+    force_manifest_refresh = False
+    batches_failed = False
+    for offset in range(0, len(candidates), settings.sync.ticket_batch_size):
+        batch = candidates[offset : offset + settings.sync.ticket_batch_size]
+        ids = [int(asset.asset_id.split(":", 1)[1]) for asset in batch]
+        try:
+            tickets = provider.get_external_download_tickets(ids)
+            ticket_by_id = {ticket.external_asset_id: ticket for ticket in tickets}
+            if set(ticket_by_id) - set(ids):
+                raise ValueError("external ticket response contains unexpected IDs")
+        except Exception as exc:
+            batches_failed = True
+            stats["error"] += len(batch)
+            stats["retryable_error"] += len(batch)
+            for asset in batch:
+                catalog.mark_asset_status(
+                    asset.asset_id, "error", retryable=True, error=str(exc)
+                )
+            log.exception("external ticket batch failed ids=%s", ids)
+            continue
+        for asset in batch:
+            external_asset_id = int(asset.asset_id.split(":", 1)[1])
+            ticket = ticket_by_id.get(external_asset_id)
+            if ticket is None:
+                stats["error"] += 1
+                stats["retryable_error"] += 1
+                catalog.mark_asset_status(
+                    asset.asset_id,
+                    "error",
+                    retryable=True,
+                    error="ticket response omitted requested external_asset_id",
+                )
+                continue
+            success = _process_external_ticket(catalog, asset, ticket, settings, stats)
+            if not success and ticket.status == "not_current":
+                force_manifest_refresh = True
+
+    complete = (
+        not force_manifest_refresh
+        and not batches_failed
+        and catalog.external_cache_complete(manifest_id)
+    )
+    stats["sync_complete"] = complete
+    failures = (
+        stats["missing"]
+        + stats["size_mismatch"]
+        + stats["not_current"]
+        + stats["error"]
+    )
+    verified_all = verify_due and len(candidates) == stats["active"]
+    catalog.set_sync_state(
+        "external",
+        etag="" if force_manifest_refresh else state_etag,
+        manifest_id=manifest_id,
+        ready=complete,
+        error="" if complete else f"external sync incomplete: {failures} failures",
+        stats_json=json.dumps(stats, ensure_ascii=False),
+        success=complete,
+        verified=verified_all,
+    )
+    log.info("sync external stats=%s", stats)
+    return stats
+
+
 def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -393,8 +649,11 @@ def run() -> None:
     )
     # Signed OSS ticket URLs must never be emitted by httpx request logging.
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    stats = sync_once()
-    if not stats["ready_for_pack"]:
+    settings = ensure_data_dirs()
+    provider = build_provider(settings)
+    finalized_stats = sync_once(provider) if "finalized" in settings.sync.kinds else {"ready_for_pack": True}
+    external_stats = sync_external_once(provider) if "external" in settings.sync.kinds else {"sync_complete": True}
+    if not finalized_stats["ready_for_pack"] or not external_stats["sync_complete"]:
         raise SystemExit(1)
 
 

@@ -59,10 +59,14 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
         s = get_settings()
         cat = Catalog(s)
         sync = cat.get_sync_state("finalized")
+        external_sync = cat.get_sync_state("external")
         asset_count = cat.count_ready_all()
+        required_sync_states = [sync]
+        if "external" in s.sync.kinds:
+            required_sync_states.append(external_sync)
         _status_cache = {
             "ready_for_pack": asset_count > 0,
-            "sync_complete": bool(sync.get("ready")),
+            "sync_complete": all(bool(item.get("ready")) for item in required_sync_states),
             "asset_count": asset_count,
             "local_only": s.local_only,
             "provider": s.provider,
@@ -71,9 +75,12 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
             "api_workers": s.api.workers,
             "finalized_count": cat.count_ready("finalized"),
             "finalized_ready": cat.is_finalized_ready(),
+            "external_count": cat.count_ready("external"),
+            "external_ready": bool(external_sync.get("ready")),
             "archive_count": cat.count_ready("archive"),
             "library_count": cat.count_ready("library"),
             "sync": sync,
+            "external_sync": external_sync,
             "paths": {
                 "data_root": str(s.data_root),
                 "finalized": str(s.finalized_dir),

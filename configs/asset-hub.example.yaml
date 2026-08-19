@@ -10,8 +10,8 @@ http:
   token: ""             # ASSET_SYNC_API_TOKEN 对应的机器密钥
   timeout_sec: 30
 sync:
-  # 当前线上 manifest/ticket 契约只支持 finalized；archive 仍是预留能力。
-  kinds: [finalized]
+  # finalized 是业务终稿；external 是当前外部素材覆盖层；archive 仍是预留能力。
+  kinds: [finalized, external]
   interval_sec: 300
   ticket_batch_size: 50
   # 即使 Manifest 未变化，也每天重新申请 ticket/Stat 一次，发现同 key 覆盖或 OSS 删除。

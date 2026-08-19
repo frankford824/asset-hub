@@ -56,15 +56,18 @@ http:
   token: <ASSET_SYNC_API_TOKEN>
   timeout_sec: 30
 sync:
-  kinds: [finalized]
+  kinds: [finalized, external]
   ticket_batch_size: 50
   verify_interval_sec: 86400
 ```
 
-HTTP provider 只消费 `yongboWorkflow` 的 finalized 权威契约：
+HTTP provider 分开消费 `yongboWorkflow` 的 finalized 业务终稿与 external-current
+素材镜像契约，external 绝不伪装成业务审批结果：
 
 - `GET /v1/integration/asset-sync/finalized/manifest`
 - `POST /v1/integration/asset-sync/finalized/download-tickets`
+- `GET /v1/integration/asset-sync/external-current/manifest`
+- `POST /v1/integration/asset-sync/external-current/download-tickets`
 - 鉴权头：`X-Asset-Sync-Token`
 - Manifest 使用弱 ETag；客户端保存 ETag，并在后续请求发送 `If-None-Match`。
 - Ticket 每批最多 50 个 `task_asset_id`，只有 `ready` 才会下载。
@@ -77,9 +80,14 @@ atomic rename。`missing`、`size_mismatch`、`not_current` 或 `error` 均不�
 Manifest 返回 304，也会按 `verify_interval_sec` 定期为全部当前对象重新申请
 ticket，以发现同 key 覆盖或 OSS 删除。
 
+external-current 以线上 source fingerprint、相对路径、大小和 OSS ticket 为准。
+已有 `/home/resourse` 文件在路径、大小和源修改时间一致时直接复用，不重复产生
+OSS 下行；新增或替换文件才写入本地镜像。线上 missing 路径作为 tombstone 覆盖
+旧 library 候选，避免索引定时器把已替换旧图重新选回。
+
 ## 统一素材库
 
-对检索和订单打包来说，系统只有一个素材库。`finalized`、`library`、`archive`
+对检索和订单打包来说，系统只有一个素材库。`finalized`、`external`、`library`、`archive`
 只是内部存储与同步策略，不是面向用户的库。检索只返回本地可用素材，不暴露
 内部来源和物理路径；订单打包按“当前版本优先、其他本地可用素材兜底”自动选择，
 结果包内附带 `素材选择说明.txt`。

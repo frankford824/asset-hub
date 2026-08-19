@@ -10,7 +10,8 @@ import pytest
 
 from asset_hub.catalog.db import Catalog
 from asset_hub.config import ensure_data_dirs, get_settings
-from asset_hub.sync.main import sync_once
+from asset_hub.catalog.db import AssetRow
+from asset_hub.sync.main import sync_external_once, sync_once
 
 
 def _manifest(manifest_id: str, object_ids: list[int]) -> dict:
@@ -60,13 +61,54 @@ def _manifest(manifest_id: str, object_ids: list[int]) -> dict:
     }
 
 
+def _external_manifest(manifest_id: str) -> dict:
+    items = [
+        {
+            "external_asset_id": 701,
+            "origin_path_hash": "a" * 64,
+            "relative_path": "1/KT/HQT11799——new/上面.jpg",
+            "file_name": "上面.jpg",
+            "mime_type": "image/jpeg",
+            "file_size": len(b"external-object-701"),
+            "storage_key": "external/701.jpg",
+            "source_modified_at": "2026-08-19T10:00:00Z",
+            "record_updated_at": "2026-08-19T10:01:00Z",
+            "deleted": False,
+        },
+        {
+            "external_asset_id": 702,
+            "origin_path_hash": "b" * 64,
+            "relative_path": "1/KT/HQT11799——old/上面.jpg",
+            "file_name": "上面.jpg",
+            "mime_type": "image/jpeg",
+            "file_size": 3,
+            "source_modified_at": "2025-01-01T00:00:00Z",
+            "record_updated_at": "2026-08-19T10:01:00Z",
+            "deleted": True,
+        },
+    ]
+    return {
+        "schema_version": 1,
+        "manifest_id": manifest_id,
+        "generated_at": "2026-08-19T10:02:00Z",
+        "item_count": 2,
+        "active_count": 1,
+        "deleted_count": 1,
+        "total_object_bytes": len(b"external-object-701"),
+        "items": items,
+    }
+
+
 class ContractStub:
     def __init__(self):
         self.manifest = _manifest("manifest-v1", [501, 502])
         self.etag = 'W/"manifest-v1"'
         self.ticket_status: dict[int, dict] = {}
+        self.external_manifest = _external_manifest("external-v1")
+        self.external_etag = 'W/"external-v1"'
         self.requests: list[tuple[str, str, str]] = []
         self.ticket_batches: list[list[int]] = []
+        self.external_ticket_batches: list[list[int]] = []
         self.server: ThreadingHTTPServer | None = None
 
     def handler(self):
@@ -102,9 +144,32 @@ class ContractStub:
                         return
                     self._json(200, {"data": state.manifest}, etag=state.etag)
                     return
+                if self.path.endswith("/external-current/manifest"):
+                    if token != "contract-secret":
+                        self._json(401, {"error": "unauthorized"})
+                        return
+                    if self.headers.get("If-None-Match") == state.external_etag:
+                        self.send_response(304)
+                        self.send_header("ETag", state.external_etag)
+                        self.end_headers()
+                        return
+                    self._json(
+                        200,
+                        {"data": state.external_manifest},
+                        etag=state.external_etag,
+                    )
+                    return
                 if self.path.startswith("/objects/"):
                     task_asset_id = int(self.path.rsplit("/", 1)[-1])
                     body = f"object-{task_asset_id}".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path.startswith("/external-objects/"):
+                    external_asset_id = int(self.path.rsplit("/", 1)[-1])
+                    body = f"external-object-{external_asset_id}".encode()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -120,6 +185,33 @@ class ContractStub:
                     return
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length) or b"{}")
+                if self.path.endswith("/external-current/download-tickets"):
+                    ids = payload.get("external_asset_ids") or []
+                    state.external_ticket_batches.append(ids)
+                    assert state.server is not None
+                    base_url = f"http://127.0.0.1:{state.server.server_port}"
+                    results = []
+                    for external_asset_id in ids:
+                        size = len(f"external-object-{external_asset_id}".encode())
+                        results.append(
+                            {
+                                "external_asset_id": external_asset_id,
+                                "status": "ready",
+                                "origin_path_hash": "a" * 64,
+                                "relative_path": "1/KT/HQT11799——new/上面.jpg",
+                                "file_name": "上面.jpg",
+                                "storage_key": f"external/{external_asset_id}.jpg",
+                                "expected_size": size,
+                                "actual_size": size,
+                                "etag": f"external-etag-{external_asset_id}",
+                                "crc64_ecma": f"external-crc-{external_asset_id}",
+                                "download_url": f"{base_url}/external-objects/{external_asset_id}",
+                                "expires_at": "2030-08-12T10:15:00Z",
+                                "retryable": False,
+                            }
+                        )
+                    self._json(200, {"data": {"results": results}})
+                    return
                 ids = payload.get("task_asset_ids") or []
                 state.ticket_batches.append(ids)
                 results = []
@@ -166,7 +258,7 @@ class ContractStub:
 
 @pytest.fixture()
 def http_settings(tmp_path, monkeypatch):
-    def configure(base_url: str):
+    def configure(base_url: str, kinds: str = "[finalized]"):
         data = tmp_path / "data"
         library = tmp_path / "library"
         library.mkdir(exist_ok=True)
@@ -182,7 +274,7 @@ http:
   token: contract-secret
   timeout_sec: 5
 sync:
-  kinds: [finalized]
+  kinds: {kinds}
   ticket_batch_size: 50
   verify_interval_sec: 86400
   ignore_globs: ["Thumbs.db", "desktop.ini", "._*"]
@@ -244,6 +336,51 @@ def test_http_manifest_ticket_download_and_tombstone(http_settings):
             if row["task_asset_id"] == 502
         ]
         assert deleted_items and deleted_items[0]["deleted"] == 1
+
+
+def test_external_overlay_downloads_replacement_and_suppresses_tombstoned_library(http_settings):
+    with ContractStub() as stub:
+        settings = http_settings(
+            f"http://127.0.0.1:{stub.server.server_port}", "[external]"
+        )
+        old = settings.library_root / "1/KT/HQT11799——old/上面.jpg"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_bytes(b"old")
+        catalog = Catalog(settings)
+        catalog.upsert_asset(
+            AssetRow(
+                asset_id="lib:1/KT/HQT11799——old/上面.jpg",
+                kind="library",
+                file_name="上面.jpg",
+                file_size=3,
+                storage_key="1/KT/HQT11799——old/上面.jpg",
+                local_path=str(old),
+                virtual_path="1/KT/HQT11799——old/上面.jpg",
+                status="ready",
+            )
+        )
+
+        stats = sync_external_once()
+        assert stats["sync_complete"] is True
+        assert stats["written"] == 1
+        assert stats["tombstone"] == 1
+        assert stub.external_ticket_batches == [[701]]
+        external = catalog.get_asset("external:701")
+        assert external is not None and external.status == "ready"
+        assert Path(external.local_path).read_bytes() == b"external-object-701"
+        hits, _ = catalog.search("HQT11799")
+        assert [item.asset_id for item in hits] == ["external:701"]
+
+        # Same-path and same-size replacements still change the source
+        # fingerprint and must request a fresh ticket instead of trusting size.
+        stub.external_manifest = _external_manifest("external-v2")
+        stub.external_manifest["items"][0]["source_modified_at"] = (
+            "2026-08-19T11:00:00Z"
+        )
+        stub.external_etag = 'W/"external-v2"'
+        replaced = sync_external_once()
+        assert replaced["written"] == 1
+        assert stub.external_ticket_batches == [[701], [701]]
 
 
 def test_retryable_ticket_error_keeps_sync_not_ready_then_retries_304(http_settings):
