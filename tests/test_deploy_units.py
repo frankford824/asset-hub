@@ -59,6 +59,14 @@ def test_library_download_uses_native_links_for_single_and_batch():
     assert 'document.createElement("a")' not in app
 
 
+def test_deploy_preserves_nginx_traversal_permission():
+    install = (ROOT / "deploy/install.sh").read_text()
+    deploy = (ROOT / "scripts/deploy_to_ybyc.sh").read_text()
+
+    assert 'chmod 751 "${ASSET_HUB_ROOT}"' in install
+    assert "sudo chmod 0751 ${ROOT}" in deploy
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 

@@ -14,5 +14,5 @@ rsync -az --delete \
   --exclude '.pytest_cache/' \
   "${SRC}/" "${REMOTE}:${ROOT}/"
 
-ssh "${REMOTE}" "sudo ${ROOT}/.venv/bin/pip install -e ${ROOT} -q && sudo systemctl restart asset-hub-api asset-hub-worker"
+ssh "${REMOTE}" "sudo chmod 0751 ${ROOT} && sudo ${ROOT}/.venv/bin/pip install -e ${ROOT} -q && sudo systemctl restart asset-hub-api asset-hub-worker"
 echo "deployed to ${REMOTE}:${ROOT}"
