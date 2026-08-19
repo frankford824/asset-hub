@@ -414,9 +414,19 @@ class Catalog:
 
     @staticmethod
     def _upsert_asset(
-        conn: sqlite3.Connection, asset: AssetRow, updated_at: float | None = None
+        conn: sqlite3.Connection,
+        asset: AssetRow,
+        updated_at: float | None = None,
+        *,
+        was_existing: bool | None = None,
     ) -> None:
         now = updated_at or asset.updated_at or time.time()
+        if was_existing is None:
+            was_existing = bool(
+                conn.execute(
+                    "SELECT 1 FROM assets WHERE asset_id=?", (asset.asset_id,)
+                ).fetchone()
+            )
         conn.execute(
             """
             INSERT INTO assets (
@@ -475,7 +485,14 @@ class Catalog:
                 asset.dedup_of_asset_id,
             ),
         )
-        conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset.asset_id,))
+        if was_existing:
+            conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset.asset_id,))
+            conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset.asset_id,))
+            conn.execute(
+                "DELETE FROM asset_name_claims WHERE asset_id=?", (asset.asset_id,)
+            )
+        if asset.deleted:
+            return
         tokens = extract_sku_tokens(
             asset.sku_code,
             asset.sku_name,
@@ -488,23 +505,21 @@ class Catalog:
             "INSERT OR IGNORE INTO sku_tokens(token, asset_id) VALUES (?,?)",
             [(token, asset.asset_id) for token in tokens],
         )
-        conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset.asset_id,))
-        if not asset.deleted:
-            conn.execute(
-                """
-                INSERT INTO assets_fts(asset_id, file_name, original_filename, storage_key, sku_code, sku_name)
-                VALUES (?,?,?,?,?,?)
-                """,
-                (
-                    asset.asset_id,
-                    asset.file_name,
-                    asset.original_filename,
-                    asset.storage_key,
-                    asset.sku_code,
-                    asset.sku_name,
-                ),
-            )
-        if not asset.deleted and asset.status == "ready" and asset.local_path:
+        conn.execute(
+            """
+            INSERT INTO assets_fts(asset_id, file_name, original_filename, storage_key, sku_code, sku_name)
+            VALUES (?,?,?,?,?,?)
+            """,
+            (
+                asset.asset_id,
+                asset.file_name,
+                asset.original_filename,
+                asset.storage_key,
+                asset.sku_code,
+                asset.sku_name,
+            ),
+        )
+        if asset.status == "ready" and asset.local_path:
             name_key = normalize_file_name(asset.file_name)
             if name_key:
                 conn.execute(
@@ -1097,6 +1112,7 @@ class Catalog:
                         virtual_path=relative_path,
                     ),
                     timestamp or time.time(),
+                    was_existing=previous is not None,
                 )
                 changed += 1
                 if is_deleted:

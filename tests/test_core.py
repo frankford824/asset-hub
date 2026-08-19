@@ -861,6 +861,58 @@ def test_external_manifest_fast_path_only_rewrites_changed_item(settings):
     assert unchanged and unchanged.status == "ready" and unchanged.etag == "etag-b"
 
 
+def test_new_asset_indexing_skips_delete_scans_and_tombstones_skip_indexes(settings):
+    catalog = Catalog(settings)
+
+    class RecordingConnection:
+        def __init__(self, conn):
+            self.conn = conn
+            self.statements: list[str] = []
+
+        def execute(self, sql, args=()):
+            self.statements.append(" ".join(sql.upper().split()))
+            return self.conn.execute(sql, args)
+
+        def executemany(self, sql, args):
+            self.statements.append(" ".join(sql.upper().split()))
+            return self.conn.executemany(sql, args)
+
+    with catalog.connect() as raw:
+        conn = RecordingConnection(raw)
+        active = AssetRow(
+            asset_id="external:9001",
+            kind="external",
+            file_name="HQT9001.jpg",
+            storage_key="external/9001.jpg",
+            file_size=10,
+            status="pending",
+            virtual_path="1/KT/HQT9001.jpg",
+        )
+        Catalog._upsert_asset(conn, active, was_existing=False)
+        assert not any(statement.startswith("DELETE FROM") for statement in conn.statements)
+        assert any("INSERT INTO ASSETS_FTS" in statement for statement in conn.statements)
+
+        conn.statements.clear()
+        Catalog._upsert_asset(conn, active, was_existing=True)
+        assert any("DELETE FROM SKU_TOKENS" in statement for statement in conn.statements)
+        assert any("DELETE FROM ASSETS_FTS" in statement for statement in conn.statements)
+        assert any("DELETE FROM ASSET_NAME_CLAIMS" in statement for statement in conn.statements)
+
+        conn.statements.clear()
+        tombstone = AssetRow(
+            asset_id="external:9002",
+            kind="external",
+            file_name="old.jpg",
+            status="tombstone",
+            deleted=1,
+            virtual_path="1/KT/old.jpg",
+        )
+        Catalog._upsert_asset(conn, tombstone, was_existing=False)
+        assert not any(statement.startswith("DELETE FROM") for statement in conn.statements)
+        assert not any("INSERT INTO ASSETS_FTS" in statement for statement in conn.statements)
+        assert not any("INSERT OR IGNORE INTO SKU_TOKENS" in statement for statement in conn.statements)
+
+
 def test_pack_rule_crud_and_job_snapshot(settings):
     rules = PackRuleStore(settings)
     defaults = rules.list(enabled_only=True)
