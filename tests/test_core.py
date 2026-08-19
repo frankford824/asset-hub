@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -580,6 +581,46 @@ def test_api_health_search(settings):
     assert claimed and claimed.started_at
     jobs = client.get("/api/v1/jobs").json()["jobs"]
     assert jobs[0]["started_at"] == pytest.approx(claimed.started_at)
+
+
+def test_asset_single_and_batch_download(settings):
+    first = settings.library_root / "HSC40063-主图.jpg"
+    second = settings.library_root / "CGK001175-详情.tif"
+    first.write_bytes(b"first-image")
+    second.write_bytes(b"second-image")
+    catalog = Catalog(settings)
+    for asset_id, path in (("upload:first", first), ("upload:second", second)):
+        catalog.upsert_asset(
+            AssetRow(
+                asset_id=asset_id,
+                kind="library",
+                file_name=path.name,
+                file_size=path.stat().st_size,
+                local_path=str(path),
+                status="ready",
+            )
+        )
+
+    from asset_hub.api.main import app
+
+    client = TestClient(app)
+    single = client.get("/api/v1/asset/download", params={"id": "upload:first"})
+    assert single.status_code == 200
+    assert single.content == b"first-image"
+    assert "attachment" in single.headers["content-disposition"]
+
+    ticket = client.post(
+        "/api/v1/assets/download-ticket",
+        json={"ids": ["upload:first", "upload:second"]},
+    )
+    assert ticket.status_code == 200
+    batch = client.get(ticket.json()["download_url"])
+    assert batch.status_code == 200
+    assert batch.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(BytesIO(batch.content)) as archive:
+        assert archive.namelist() == [first.name, second.name]
+        assert archive.read(first.name) == b"first-image"
+        assert archive.read(second.name) == b"second-image"
 
 
 def test_create_job_allows_library_fallback_before_sync_complete(settings):

@@ -6,7 +6,8 @@ const state = {
   path: "", query: "", offset: 0, hasMore: false,
   directories: [], files: [], selected: new Set(), focusedId: null,
   history: [""], historyIndex: 0, treeCache: new Map(), expanded: new Set([""]),
-  batchDownloadUrl: "", previewId: null, searchTimer: null, toastTimer: null,
+  batchDownloadUrl: "", downloadPreparing: false,
+  previewId: null, searchTimer: null, toastTimer: null,
 };
 
 function escapeHtml(value) {
@@ -190,7 +191,7 @@ function bindFileTiles() {
 function selectFile(id, additive = false) { if (!additive) state.selected.clear(); if (additive && state.selected.has(id)) state.selected.delete(id); else state.selected.add(id); state.focusedId = id; renderLibrary(); updateSelection(); }
 function focusedFile() { return state.files.find((file) => file.asset_id === state.focusedId) || state.files.find((file) => state.selected.has(file.asset_id)); }
 function updateSelection() {
-  const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count; $("#download-selected").disabled = !count;
+  const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count; $("#download-selected").disabled = !count || state.downloadPreparing;
   const file = focusedFile(); $("#detail-empty").hidden = Boolean(file); $("#file-detail").hidden = !file;
   $(".detail-pane").classList.toggle("open", Boolean(file));
   if (file) renderDetail(file); prepareBatchTicket();
@@ -204,16 +205,26 @@ async function prepareBatchTicket() { const ids = [...state.selected]; state.bat
 function startDownloadDrag(event, id) { if (!state.selected.has(id)) { state.selected = new Set([id]); state.focusedId = id; updateSelection(); } const ids = [...state.selected]; const file = state.files.find((item) => item.asset_id === id); const url = ids.length > 1 ? state.batchDownloadUrl : new URL(downloadUrl(id), location.href).href; if (!url) { event.preventDefault(); toast("批量下载正在准备，请稍后再拖一次"); return; } const name = ids.length > 1 ? `素材下载_${ids.length}项.zip` : file.file_name; event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("DownloadURL", `application/octet-stream:${name}:${url}`); event.dataTransfer.setData("text/uri-list", url); }
 async function downloadSelected() {
   const ids = [...state.selected]; if (!ids.length) return;
-  let url = ids.length === 1 ? downloadUrl(ids[0]) : state.batchDownloadUrl;
-  if (ids.length > 1 && !url) {
-    const ticket = await api("/api/v1/assets/download-ticket", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }),
-    });
-    url = ticket.download_url;
+  if (state.downloadPreparing) return;
+  const button = $("#download-selected");
+  state.downloadPreparing = true; button.disabled = true;
+  button.textContent = ids.length > 1 ? `正在准备 ${ids.length} 项…` : "正在准备…";
+  try {
+    let url = ids.length === 1 ? downloadUrl(ids[0]) : state.batchDownloadUrl;
+    if (ids.length > 1 && !url) {
+      const ticket = await api("/api/v1/assets/download-ticket", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }),
+      });
+      url = ticket.download_url;
+    }
+    // 交给浏览器原生导航处理 Content-Disposition，避免异步创建的临时
+    // <a download> 在 Chrome 中被当作失去用户手势而静默拦截。
+    window.location.assign(new URL(url, location.href).href);
+    toast(ids.length > 1 ? `已开始下载 ${ids.length} 项 ZIP` : `已开始下载 ${focusedFile()?.file_name || "文件"}`);
+  } finally {
+    state.downloadPreparing = false; button.textContent = "下载所选";
+    button.disabled = !state.selected.size;
   }
-  const anchor = document.createElement("a"); anchor.href = url;
-  anchor.download = ids.length > 1 ? "素材下载.zip" : focusedFile()?.file_name || "素材下载";
-  document.body.appendChild(anchor); anchor.click(); anchor.remove();
 }
 
 /* rectangle select */

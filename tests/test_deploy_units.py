@@ -47,6 +47,14 @@ def test_library_search_supports_enter_and_clear():
     assert 'librarySearch.addEventListener("search", submitLibrarySearch)' in app
 
 
+def test_library_download_uses_native_navigation_for_single_and_batch():
+    app = (ROOT / "web/dist/app.js").read_text()
+
+    assert 'window.location.assign(new URL(url, location.href).href)' in app
+    assert '正在准备 ${ids.length} 项' in app
+    assert 'document.createElement("a")' not in app
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 
