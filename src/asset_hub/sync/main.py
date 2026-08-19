@@ -491,6 +491,8 @@ def sync_external_once(provider: SyncProvider | None = None) -> dict:
         "active": 0,
         "deleted": 0,
         "reused": 0,
+        "changed": 0,
+        "unchanged": 0,
         "requested": 0,
         "ready": 0,
         "written": 0,
@@ -544,6 +546,8 @@ def sync_external_once(provider: SyncProvider | None = None) -> dict:
         stats["active"] = snapshot["active"]
         stats["deleted"] = snapshot["deleted"]
         stats["reused"] = snapshot["reused"]
+        stats["changed"] = snapshot["changed"]
+        stats["unchanged"] = snapshot["unchanged"]
         stats["tombstone"] = snapshot["deleted"] + snapshot["exited"]
         state_etag = manifest.etag
         manifest_id = manifest.manifest_id

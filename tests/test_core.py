@@ -24,7 +24,7 @@ from asset_hub.pack.excel import (
 )
 from asset_hub.pack.ziputil import zip_paths
 from asset_hub.pack.rules import PackRuleStore
-from asset_hub.sync.provider import ManifestItem
+from asset_hub.sync.provider import ExternalManifestItem, ManifestItem
 from asset_hub.sync.main import sync_once
 
 
@@ -819,6 +819,46 @@ def test_manifest_same_filename_different_content_requires_own_ticket(settings):
     assert reapplied["unchanged_objects"] == 0
     assert reapplied["changed_items"] == 0
     assert reapplied["unchanged_items"] == 1
+
+
+def test_external_manifest_fast_path_only_rewrites_changed_item(settings):
+    catalog = Catalog(settings)
+    path_a = settings.library_root / "1/KT/SKU-A.jpg"
+    path_b = settings.library_root / "1/KT/SKU-B.jpg"
+    path_a.parent.mkdir(parents=True, exist_ok=True)
+    path_a.write_bytes(b"aaaa")
+    path_b.write_bytes(b"bbbb")
+
+    def item(asset_id: int, name: str, modified: float) -> ExternalManifestItem:
+        return ExternalManifestItem(
+            external_asset_id=asset_id,
+            origin_path_hash=f"{asset_id:064x}",
+            relative_path=f"1/KT/{name}",
+            file_name=name,
+            mime_type="image/jpeg",
+            file_size=4,
+            storage_key=f"external/{asset_id}.jpg",
+            source_modified_at=modified,
+            record_updated_at=modified,
+            deleted=False,
+        )
+
+    first = catalog.apply_external_manifest(
+        [item(1, "SKU-A.jpg", 100), item(2, "SKU-B.jpg", 100)], "external-v1"
+    )
+    assert first["changed"] == 2 and first["reused"] == 2
+    catalog.mark_asset_status("external:1", "ready", etag="etag-a")
+    catalog.mark_asset_status("external:2", "ready", etag="etag-b")
+
+    second = catalog.apply_external_manifest(
+        [item(1, "SKU-A.jpg", 200), item(2, "SKU-B.jpg", 100)], "external-v2"
+    )
+    assert second["changed"] == 1
+    assert second["unchanged"] == 1
+    changed = catalog.get_asset("external:1")
+    unchanged = catalog.get_asset("external:2")
+    assert changed and changed.status == "pending" and changed.etag == ""
+    assert unchanged and unchanged.status == "ready" and unchanged.etag == "etag-b"
 
 
 def test_pack_rule_crud_and_job_snapshot(settings):

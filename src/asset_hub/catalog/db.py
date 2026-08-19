@@ -993,7 +993,7 @@ class Catalog:
         self, items: Sequence[Any], manifest_id: str
     ) -> dict[str, int]:
         """Apply the current external overlay without deleting retained files."""
-        active = deleted = pending = reused = 0
+        active = deleted = pending = reused = changed = unchanged = 0
         seen: set[str] = set()
         with self.connect() as conn:
             existing = {
@@ -1014,16 +1014,26 @@ class Catalog:
                     raise ValueError(
                         f"external relative_path escapes library root: {relative_path}"
                     )
-                timestamp = float(
-                    item.source_modified_at or item.record_updated_at or 0
-                )
                 previous = existing.get(asset_id)
                 is_deleted = bool(item.deleted)
+                source_timestamp = float(item.source_modified_at or 0)
+                timestamp = source_timestamp or (
+                    float(previous["updated_at"] or 0)
+                    if previous
+                    else float(item.record_updated_at or 0)
+                )
+                desired_storage_key = "" if is_deleted else item.storage_key
+                desired_format = Path(item.file_name).suffix.lower().lstrip(".")
                 metadata_changed = bool(
                     previous
                     and (
-                        previous["storage_key"] != item.storage_key
+                        previous["storage_key"] != desired_storage_key
                         or int(previous["file_size"] or 0) != int(item.file_size)
+                        or previous["file_name"] != item.file_name
+                        or previous["mime_type"] != item.mime_type
+                        or previous["format"] != desired_format
+                        or previous["virtual_path"] != relative_path
+                        or int(previous["deleted"] or 0) != int(is_deleted)
                         or abs(float(previous["updated_at"] or 0) - timestamp)
                         > 0.001
                     )
@@ -1043,16 +1053,41 @@ class Catalog:
                     if is_deleted
                     else ("ready" if local_valid else "pending")
                 )
+                if is_deleted:
+                    deleted += 1
+                else:
+                    active += 1
+                    reused += int(local_valid)
+                    pending += int(not local_valid)
+                unchanged_active = bool(
+                    previous
+                    and not is_deleted
+                    and not metadata_changed
+                    and local_valid
+                    and previous["status"] == "ready"
+                    and int(previous["deleted"] or 0) == 0
+                    and previous["local_path"] == str(destination)
+                )
+                unchanged_tombstone = bool(
+                    previous
+                    and is_deleted
+                    and not metadata_changed
+                    and previous["status"] == "tombstone"
+                    and int(previous["deleted"] or 0) == 1
+                )
+                if unchanged_active or unchanged_tombstone:
+                    unchanged += 1
+                    continue
                 self._upsert_asset(
                     conn,
                     AssetRow(
                         asset_id=asset_id,
                         kind="external",
-                        storage_key="" if is_deleted else item.storage_key,
+                        storage_key=desired_storage_key,
                         file_name=item.file_name,
                         original_filename=item.file_name,
                         file_size=int(item.file_size),
-                        format=Path(item.file_name).suffix.lower().lstrip("."),
+                        format=desired_format,
                         mime_type=item.mime_type,
                         local_path=str(destination),
                         status=status,
@@ -1063,15 +1098,12 @@ class Catalog:
                     ),
                     timestamp or time.time(),
                 )
+                changed += 1
                 if is_deleted:
-                    deleted += 1
                     conn.execute(
                         "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
                     )
                 else:
-                    active += 1
-                    reused += int(local_valid)
-                    pending += int(not local_valid)
                     if metadata_changed:
                         conn.execute(
                             "UPDATE assets SET etag='',crc64_ecma='' WHERE asset_id=?",
@@ -1097,6 +1129,8 @@ class Catalog:
             "deleted": deleted,
             "pending": pending,
             "reused": reused,
+            "changed": changed,
+            "unchanged": unchanged,
             "exited": exited,
         }
 
