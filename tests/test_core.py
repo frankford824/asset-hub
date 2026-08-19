@@ -367,6 +367,53 @@ def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(se
     assert done.progress["matched"] == 3
 
 
+def test_pack_keeps_single_finalized_asset_as_a_file(settings):
+    source = settings.library_root / "菲瑶-常规KT板-升小学手举牌-我是小学生啦-20-50cm.jpg"
+    source.write_bytes(b"single-finalized")
+    catalog = Catalog(settings)
+    catalog.upsert_asset(
+        AssetRow(
+            asset_id="finalized:10805",
+            task_asset_id=10805,
+            kind="finalized",
+            file_name=source.name,
+            file_size=source.stat().st_size,
+            sku_code="CGK000672",
+            sku_name="菲瑶/常规KT板/升小学手举牌/我是小学生啦",
+            local_path=str(source),
+            status="ready",
+        )
+    )
+
+    xlsx = settings.tmp_dir / "single-finalized.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["编码"])
+    sheet.append(["CGK000672"])
+    workbook.save(xlsx)
+    rules = [
+        {"name": "当前版本优先", "handler": "prefer_current"},
+        {"name": "保留商品名称与尺寸", "handler": "rename_sku_sequence"},
+        {"name": "媒体文件快速打包", "handler": "fast_zip"},
+    ]
+    store = JobStore(settings)
+    job = store.create(filename=xlsx.name, super_dir_name="pack", meta={"rules": rules})
+    job_dir = store.job_dir(job.id)
+    (job_dir / "input.xlsx").write_bytes(xlsx.read_bytes())
+    claimed = store.claim_next()
+    assert claimed is not None
+    from asset_hub.worker.main import process_job
+
+    process_job(store, catalog, claimed.id)
+    done = store.get(claimed.id)
+    assert done is not None and done.status == "done"
+    import zipfile
+
+    with zipfile.ZipFile(done.archive_path) as archive:
+        images = [name for name in archive.namelist() if name.lower().endswith(".jpg")]
+    assert images == [f"pack/{source.name}"]
+
+
 def test_pack_chooses_one_best_file_for_repeated_sku_outside_product_directory(settings):
     catalog = Catalog(settings)
     parent = settings.library_root / "冯新妮皮普和波西KT板"

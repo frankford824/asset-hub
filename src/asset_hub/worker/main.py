@@ -205,7 +205,10 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                                 else f"{sku}——{product_name}"
                             )
                     product_groups.setdefault(descriptive_parent, []).append(asset)
-                should_group = len(assets) > 1 or any(product_groups)
+                # A product description is only a naming hint. It must not turn a
+                # single finalized file into a one-file directory (for example,
+                # an upstream ``set`` revision that currently contains one item).
+                should_group = len(assets) > 1
                 if should_group and "rename_sku_sequence" in handlers:
                     for copy_index in range(1, copies + 1):
                         for product_parent, grouped_assets in product_groups.items():
