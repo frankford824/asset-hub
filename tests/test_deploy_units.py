@@ -54,6 +54,7 @@ def test_library_download_uses_native_links_for_single_and_batch():
     assert '<a id="download-selected"' in html
     assert 'download.href = downloadUrl([...state.selected][0])' in app
     assert 'download.href = state.batchDownloadUrl' in app
+    assert 'download.download = "素材下载.zip"' in app
     assert '正在准备 ${count} 项' in app
     assert 'document.createElement("a")' not in app
 

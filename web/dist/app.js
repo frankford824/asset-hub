@@ -192,9 +192,9 @@ function selectFile(id, additive = false) { if (!additive) state.selected.clear(
 function focusedFile() { return state.files.find((file) => file.asset_id === state.focusedId) || state.files.find((file) => state.selected.has(file.asset_id)); }
 function updateSelection() {
   const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count;
-  const download = $("#download-selected"); download.removeAttribute("href"); download.setAttribute("aria-disabled", "true");
+  const download = $("#download-selected"); download.removeAttribute("href"); download.removeAttribute("download"); download.setAttribute("aria-disabled", "true");
   download.textContent = count > 1 ? `正在准备 ${count} 项…` : "下载所选";
-  if (count === 1) { download.href = downloadUrl([...state.selected][0]); download.setAttribute("aria-disabled", "false"); }
+  if (count === 1) { download.href = downloadUrl([...state.selected][0]); download.download = focusedFile()?.file_name || "素材下载"; download.setAttribute("aria-disabled", "false"); }
   const file = focusedFile(); $("#detail-empty").hidden = Boolean(file); $("#file-detail").hidden = !file;
   $(".detail-pane").classList.toggle("open", Boolean(file));
   if (file) renderDetail(file); if (count > 1) prepareBatchTicket(); else { state.batchDownloadUrl = ""; state.batchDownloadSignature = ""; }
@@ -211,7 +211,7 @@ async function prepareBatchTicket() {
     const data = await api("/api/v1/assets/download-ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
     if (signature !== state.batchDownloadSignature || ids.length !== state.selected.size || !ids.every((id) => state.selected.has(id))) return;
     state.batchDownloadUrl = new URL(data.download_url, location.href).href;
-    const download = $("#download-selected"); download.href = state.batchDownloadUrl; download.setAttribute("aria-disabled", "false"); download.textContent = `下载所选 (${ids.length})`;
+    const download = $("#download-selected"); download.href = state.batchDownloadUrl; download.download = "素材下载.zip"; download.setAttribute("aria-disabled", "false"); download.textContent = `下载所选 (${ids.length})`;
   } catch (_) {
     if (signature === state.batchDownloadSignature) { $("#download-selected").textContent = "批量下载不可用"; toast("批量 ZIP 准备失败，请重新选择后再试"); }
   }
