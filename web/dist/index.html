@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>统一素材库</title>
-  <link rel="stylesheet" href="/styles.css?v=18" />
+  <link rel="stylesheet" href="/styles.css?v=19" />
 </head>
 <body>
   <header class="topbar">
@@ -70,7 +70,7 @@
         <input id="folder-picker" type="file" webkitdirectory multiple hidden />
         <button id="upload-files" class="btn primary" type="button">上传文件</button>
         <button id="upload-folder" class="btn secondary" type="button">上传文件夹</button>
-        <button id="download-selected" class="btn secondary" type="button" disabled>下载所选</button>
+        <a id="download-selected" class="btn secondary" aria-disabled="true">下载所选</a>
       </div>
 
       <div class="file-workspace">
@@ -147,6 +147,6 @@
   </section>
 
   <div id="toast" class="toast" hidden></div>
-  <script src="/app.js?v=18"></script>
+  <script src="/app.js?v=19"></script>
 </body>
 </html>

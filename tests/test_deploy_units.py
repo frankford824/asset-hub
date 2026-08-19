@@ -47,11 +47,14 @@ def test_library_search_supports_enter_and_clear():
     assert 'librarySearch.addEventListener("search", submitLibrarySearch)' in app
 
 
-def test_library_download_uses_native_navigation_for_single_and_batch():
+def test_library_download_uses_native_links_for_single_and_batch():
     app = (ROOT / "web/dist/app.js").read_text()
+    html = (ROOT / "web/dist/index.html").read_text()
 
-    assert 'window.location.assign(new URL(url, location.href).href)' in app
-    assert '正在准备 ${ids.length} 项' in app
+    assert '<a id="download-selected"' in html
+    assert 'download.href = downloadUrl([...state.selected][0])' in app
+    assert 'download.href = state.batchDownloadUrl' in app
+    assert '正在准备 ${count} 项' in app
     assert 'document.createElement("a")' not in app
 
 

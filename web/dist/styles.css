@@ -45,7 +45,7 @@ h1, h2, p { margin-top: 0; } h1 { margin-bottom: 5px; font-size: 25px; } h2 { fo
 .selected-summary { display: flex; justify-content: space-between; margin: 17px 0 10px; color: var(--muted); font-size: 12px; }
 .selected-summary button, .text-btn { border: 0; padding: 0; color: var(--accent); background: transparent; cursor: pointer; }
 .btn { min-height: 36px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border-radius: 6px; padding: 0 14px; border: 1px solid transparent; text-decoration: none; cursor: pointer; font-weight: 650; font-size: 12.5px; }
-.btn:disabled { opacity: .46; cursor: not-allowed; }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .46; cursor: not-allowed; }
 .btn.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
 .btn.primary:hover { background: #066c77; }.btn.secondary { color: #314255; background: #fff; border-color: #cfd9e3; }.btn.secondary:hover { border-color: #8da3b8; background: #f8fafc; }
 .btn.wide { width: 100%; }.form-message { padding: 9px 11px; border-radius: 5px; margin: 10px 0 0; font-size: 12px; }.form-message.err { color: #8e2925; background: #fff0ee; }

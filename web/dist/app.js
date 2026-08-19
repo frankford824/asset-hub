@@ -6,7 +6,7 @@ const state = {
   path: "", query: "", offset: 0, hasMore: false,
   directories: [], files: [], selected: new Set(), focusedId: null,
   history: [""], historyIndex: 0, treeCache: new Map(), expanded: new Set([""]),
-  batchDownloadUrl: "", downloadPreparing: false,
+  batchDownloadUrl: "", batchDownloadSignature: "",
   previewId: null, searchTimer: null, toastTimer: null,
 };
 
@@ -191,41 +191,32 @@ function bindFileTiles() {
 function selectFile(id, additive = false) { if (!additive) state.selected.clear(); if (additive && state.selected.has(id)) state.selected.delete(id); else state.selected.add(id); state.focusedId = id; renderLibrary(); updateSelection(); }
 function focusedFile() { return state.files.find((file) => file.asset_id === state.focusedId) || state.files.find((file) => state.selected.has(file.asset_id)); }
 function updateSelection() {
-  const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count; $("#download-selected").disabled = !count || state.downloadPreparing;
+  const count = state.selected.size; $("#selection-count").textContent = count ? `已选择 ${count} 项` : "未选择"; $("#clear-selection").hidden = !count;
+  const download = $("#download-selected"); download.removeAttribute("href"); download.setAttribute("aria-disabled", "true");
+  download.textContent = count > 1 ? `正在准备 ${count} 项…` : "下载所选";
+  if (count === 1) { download.href = downloadUrl([...state.selected][0]); download.setAttribute("aria-disabled", "false"); }
   const file = focusedFile(); $("#detail-empty").hidden = Boolean(file); $("#file-detail").hidden = !file;
   $(".detail-pane").classList.toggle("open", Boolean(file));
-  if (file) renderDetail(file); prepareBatchTicket();
+  if (file) renderDetail(file); if (count > 1) prepareBatchTicket(); else { state.batchDownloadUrl = ""; state.batchDownloadSignature = ""; }
 }
 function renderDetail(file) {
   const previewable = file.previewable || isImage(file.file_name); const image = $("#detail-image"); image.hidden = !previewable; $("#detail-placeholder").hidden = previewable;
   if (previewable) image.src = previewUrl(file.asset_id); else $("#detail-placeholder").textContent = (file.file_name.split(".").pop() || "FILE").toUpperCase();
   $("#detail-name").textContent = file.file_name; $("#detail-size").textContent = fmtBytes(file.file_size); $("#detail-time").textContent = fmtTime(file.updated_at); $("#detail-path").textContent = `/${file.virtual_path || file.file_name}`; $("#detail-sku").textContent = file.sku_code || "—"; $("#detail-dedup").textContent = file.deduplicated ? "已按文件名复用" : "唯一文件名"; $("#open-large-preview").hidden = !previewable; $("#single-download").href = downloadUrl(file.asset_id);
 }
-async function prepareBatchTicket() { const ids = [...state.selected]; state.batchDownloadUrl = ""; if (ids.length < 2) return; try { const data = await api("/api/v1/assets/download-ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) }); if (ids.every((id) => state.selected.has(id)) && ids.length === state.selected.size) state.batchDownloadUrl = new URL(data.download_url, location.href).href; } catch (_) {} }
-function startDownloadDrag(event, id) { if (!state.selected.has(id)) { state.selected = new Set([id]); state.focusedId = id; updateSelection(); } const ids = [...state.selected]; const file = state.files.find((item) => item.asset_id === id); const url = ids.length > 1 ? state.batchDownloadUrl : new URL(downloadUrl(id), location.href).href; if (!url) { event.preventDefault(); toast("批量下载正在准备，请稍后再拖一次"); return; } const name = ids.length > 1 ? `素材下载_${ids.length}项.zip` : file.file_name; event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("DownloadURL", `application/octet-stream:${name}:${url}`); event.dataTransfer.setData("text/uri-list", url); }
-async function downloadSelected() {
-  const ids = [...state.selected]; if (!ids.length) return;
-  if (state.downloadPreparing) return;
-  const button = $("#download-selected");
-  state.downloadPreparing = true; button.disabled = true;
-  button.textContent = ids.length > 1 ? `正在准备 ${ids.length} 项…` : "正在准备…";
+async function prepareBatchTicket() {
+  const ids = [...state.selected]; if (ids.length < 2) return;
+  const signature = ids.join("\u001f"); state.batchDownloadUrl = ""; state.batchDownloadSignature = signature;
   try {
-    let url = ids.length === 1 ? downloadUrl(ids[0]) : state.batchDownloadUrl;
-    if (ids.length > 1 && !url) {
-      const ticket = await api("/api/v1/assets/download-ticket", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }),
-      });
-      url = ticket.download_url;
-    }
-    // 交给浏览器原生导航处理 Content-Disposition，避免异步创建的临时
-    // <a download> 在 Chrome 中被当作失去用户手势而静默拦截。
-    window.location.assign(new URL(url, location.href).href);
-    toast(ids.length > 1 ? `已开始下载 ${ids.length} 项 ZIP` : `已开始下载 ${focusedFile()?.file_name || "文件"}`);
-  } finally {
-    state.downloadPreparing = false; button.textContent = "下载所选";
-    button.disabled = !state.selected.size;
+    const data = await api("/api/v1/assets/download-ticket", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids }) });
+    if (signature !== state.batchDownloadSignature || ids.length !== state.selected.size || !ids.every((id) => state.selected.has(id))) return;
+    state.batchDownloadUrl = new URL(data.download_url, location.href).href;
+    const download = $("#download-selected"); download.href = state.batchDownloadUrl; download.setAttribute("aria-disabled", "false"); download.textContent = `下载所选 (${ids.length})`;
+  } catch (_) {
+    if (signature === state.batchDownloadSignature) { $("#download-selected").textContent = "批量下载不可用"; toast("批量 ZIP 准备失败，请重新选择后再试"); }
   }
 }
+function startDownloadDrag(event, id) { if (!state.selected.has(id)) { state.selected = new Set([id]); state.focusedId = id; updateSelection(); } const ids = [...state.selected]; const file = state.files.find((item) => item.asset_id === id); const url = ids.length > 1 ? state.batchDownloadUrl : new URL(downloadUrl(id), location.href).href; if (!url) { event.preventDefault(); toast("批量下载正在准备，请稍后再拖一次"); return; } const name = ids.length > 1 ? `素材下载_${ids.length}项.zip` : file.file_name; event.dataTransfer.effectAllowed = "copy"; event.dataTransfer.setData("DownloadURL", `application/octet-stream:${name}:${url}`); event.dataTransfer.setData("text/uri-list", url); }
 
 /* rectangle select */
 let dragSelect = null;
@@ -280,7 +271,7 @@ $("#upload-files").addEventListener("click", () => $("#file-picker").click()); $
 $("#file-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.name }))).finally(() => { event.target.value = ""; })); $("#folder-picker").addEventListener("change", (event) => uploadItems([...event.target.files].map((file) => ({ file, relative: file.webkitRelativePath || file.name }))).finally(() => { event.target.value = ""; }));
 const canvas = $("#file-canvas"); canvas.addEventListener("pointerdown", beginRectangle); canvas.addEventListener("pointermove", moveRectangle); canvas.addEventListener("pointerup", endRectangle); canvas.addEventListener("pointercancel", endRectangle);
 let dragDepth = 0; canvas.addEventListener("dragenter", (event) => { if ([...event.dataTransfer.types].includes("Files")) { event.preventDefault(); dragDepth += 1; $("#drop-zone").hidden = false; } }); canvas.addEventListener("dragover", (event) => { if ([...event.dataTransfer.types].includes("Files")) { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; } }); canvas.addEventListener("dragleave", () => { dragDepth -= 1; if (dragDepth <= 0) { dragDepth = 0; $("#drop-zone").hidden = true; } }); canvas.addEventListener("drop", async (event) => { event.preventDefault(); dragDepth = 0; $("#drop-zone").hidden = true; uploadItems(await entriesFromDrop(event.dataTransfer)); });
-$("#download-selected").addEventListener("click", () => downloadSelected().catch(showError)); $("#clear-selection").addEventListener("click", () => { state.selected.clear(); state.focusedId = null; renderLibrary(); updateSelection(); }); $("#load-more").addEventListener("click", () => loadLibrary(state.path, { append: true }).catch(showError));
+$("#download-selected").addEventListener("click", (event) => { const count = state.selected.size; if (!count || event.currentTarget.getAttribute("aria-disabled") === "true") { event.preventDefault(); if (count > 1) toast("批量 ZIP 正在准备，请稍候"); return; } toast(count > 1 ? `已开始下载 ${count} 项 ZIP` : `已开始下载 ${focusedFile()?.file_name || "文件"}`); }); $("#clear-selection").addEventListener("click", () => { state.selected.clear(); state.focusedId = null; renderLibrary(); updateSelection(); }); $("#load-more").addEventListener("click", () => loadLibrary(state.path, { append: true }).catch(showError));
 $("#detail-preview").addEventListener("click", () => { const file = focusedFile(); if (file) openPreview(file.asset_id); }); $("#open-large-preview").addEventListener("click", () => { const file = focusedFile(); if (file) openPreview(file.asset_id); }); $("#close-preview").addEventListener("click", closePreview); $("#preview-prev").addEventListener("click", () => previewStep(-1)); $("#preview-next").addEventListener("click", () => previewStep(1)); $("#preview-image").addEventListener("click", (event) => event.target.classList.toggle("zoomed"));
 $("#close-detail").addEventListener("click", () => { state.selected.clear(); state.focusedId = null; $(".detail-pane").classList.remove("open"); renderLibrary(); updateSelection(); });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closePreview(); closeRuleModal(); closeMessage(); } if (!$("#preview-modal").hidden && event.key === "ArrowLeft") previewStep(-1); if (!$("#preview-modal").hidden && event.key === "ArrowRight") previewStep(1); });
