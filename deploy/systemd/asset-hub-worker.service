@@ -2,7 +2,8 @@
 Description=asset-hub pack workers
 After=network-online.target asset-hub-api.service
 Wants=network-online.target
-RequiresMountsFor=/home/resourse
+Requires=asset-hub-library-mount.service
+After=asset-hub-library-mount.service
 
 [Service]
 Type=simple

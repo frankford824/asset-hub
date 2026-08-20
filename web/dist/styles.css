@@ -20,7 +20,7 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 .top-meta { display: flex; align-items: center; gap: 14px; padding: 0 18px; color: var(--muted); font-size: 12px; }
 .status-dot::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #9aa7b5; }
-.status-dot.ok::before { background: #20a067; } .status-dot.warn::before { background: #e09a33; }
+.status-dot.ok::before { background: #20a067; } .status-dot.warn::before { background: #e09a33; } .status-dot.error::before { background: #d64545; }
 
 main { min-height: calc(100vh - 58px); }
 .view { min-height: calc(100vh - 58px); }

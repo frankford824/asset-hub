@@ -60,9 +60,12 @@ function switchTab(name) {
 async function refreshStatus() {
   const status = await api("/api/v1/status");
   $("#meta-count").textContent = `素材 ${(status.asset_count || 0).toLocaleString()}`;
+  const mountOffline = status.library_mount_required && !status.library_mounted;
   const ready = status.ready_for_pack || status.asset_count > 0;
-  const chip = $("#meta-ready"); chip.textContent = ready ? (status.sync_complete ? "已就绪" : "同步中，可用") : "准备中";
-  chip.className = `status-dot ${ready ? "ok" : "warn"}`;
+  const chip = $("#meta-ready"); chip.textContent = mountOffline ? "素材盘离线" : (ready ? (status.sync_complete ? "已就绪" : "同步中，可用") : "准备中");
+  chip.className = `status-dot ${mountOffline ? "error" : (ready ? "ok" : "warn")}`;
+  $("#pack-submit").disabled = mountOffline;
+  $("#pack-submit").title = mountOffline ? "素材盘未挂载，暂不能打包" : "";
 }
 
 /* rules */

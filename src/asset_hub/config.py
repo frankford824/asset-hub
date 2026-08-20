@@ -35,6 +35,7 @@ class ApiConfig(BaseModel):
 
 class Settings(BaseModel):
     library_root: Path = Path("/home/resourse")
+    library_mount_required: bool = False
     data_root: Path = Path("/var/lib/asset-hub")
     local_only: bool = True
     workers: int = 3
@@ -110,3 +111,9 @@ def ensure_data_dirs(settings: Settings | None = None) -> Settings:
     ):
         d.mkdir(parents=True, exist_ok=True)
     return s
+
+
+def library_mount_available(settings: Settings | None = None) -> bool:
+    """Fail closed in production when the configured library mount is absent."""
+    s = settings or get_settings()
+    return not s.library_mount_required or os.path.ismount(s.library_root)

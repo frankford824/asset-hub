@@ -47,6 +47,14 @@ def test_library_search_supports_enter_and_clear():
     assert 'librarySearch.addEventListener("search", submitLibrarySearch)' in app
 
 
+def test_frontend_blocks_packaging_when_library_mount_is_offline():
+    app = (ROOT / "web/dist/app.js").read_text()
+
+    assert 'status.library_mount_required && !status.library_mounted' in app
+    assert '"素材盘离线"' in app
+    assert '$("#pack-submit").disabled = mountOffline' in app
+
+
 def test_library_download_uses_native_links_for_single_and_batch():
     app = (ROOT / "web/dist/app.js").read_text()
     html = (ROOT / "web/dist/index.html").read_text()
@@ -67,14 +75,26 @@ def test_deploy_preserves_nginx_traversal_permission():
     assert "sudo chmod 0751 ${ROOT}" in deploy
 
 
-def test_data_consumers_require_the_library_mount():
+def test_data_consumers_require_the_library_mount_guard():
     for name in (
         "asset-hub-worker.service",
         "asset-hub-sync.service",
         "asset-hub-index.service",
     ):
         unit = (ROOT / "deploy/systemd" / name).read_text()
-        assert "RequiresMountsFor=/home/resourse" in unit
+        assert "Requires=asset-hub-library-mount.service" in unit
+        assert "After=asset-hub-library-mount.service" in unit
+
+
+def test_mount_guard_repairs_only_a_confirmed_dirty_ntfs_volume():
+    guard = (ROOT / "deploy/ensure-library-mount.sh").read_text()
+
+    assert 'findmnt --fstab --evaluate' in guard
+    assert '[[ -b "$device" ]]' in guard
+    assert '[[ "$fstype" == "ntfs" ]]' in guard
+    assert 'volume is dirty' in guard
+    assert 'ntfsfix -d "$device"' in guard
+    assert "mount -o force" not in guard
 
 
 def test_sync_timer_waits_from_completion():

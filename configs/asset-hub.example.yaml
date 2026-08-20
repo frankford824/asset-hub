@@ -1,5 +1,6 @@
 # /etc/asset-hub/config.yaml 默认形态（install.sh 会拷贝并可用环境变量覆盖路径）
 library_root: /home/resourse
+library_mount_required: true
 data_root: /var/lib/asset-hub
 local_only: true
 workers: 3

@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from asset_hub.config import Settings, load_settings
+from asset_hub.config import Settings, library_mount_available, load_settings
 
 
 def test_settings_defaults(tmp_path, monkeypatch):
@@ -28,3 +28,12 @@ def test_settings_env_override(tmp_path, monkeypatch):
 def test_ticket_batch_cannot_exceed_upstream_contract():
     with pytest.raises(ValidationError):
         Settings.model_validate({"sync": {"ticket_batch_size": 51}})
+
+
+def test_library_mount_check_is_explicit(monkeypatch):
+    optional = Settings.model_validate({"library_mount_required": False})
+    required = Settings.model_validate({"library_mount_required": True})
+    monkeypatch.setattr("asset_hub.config.os.path.ismount", lambda _path: False)
+
+    assert library_mount_available(optional) is True
+    assert library_mount_available(required) is False

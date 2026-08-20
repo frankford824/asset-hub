@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from asset_hub import __version__
 from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path
-from asset_hub.config import ensure_data_dirs, get_settings
+from asset_hub.config import ensure_data_dirs, get_settings, library_mount_available
 from asset_hub.jobs import JobStore
 from asset_hub.pack.rules import PackRuleStore, SUPPORTED_HANDLERS
 from asset_hub.pack.excel import deduplicate_rows, read_excel_rows
@@ -61,11 +61,12 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
         sync = cat.get_sync_state("finalized")
         external_sync = cat.get_sync_state("external")
         asset_count = cat.count_ready_all()
+        library_mounted = library_mount_available(s)
         required_sync_states = [sync]
         if "external" in s.sync.kinds:
             required_sync_states.append(external_sync)
         _status_cache = {
-            "ready_for_pack": asset_count > 0,
+            "ready_for_pack": asset_count > 0 and library_mounted,
             "sync_complete": all(bool(item.get("ready")) for item in required_sync_states),
             "asset_count": asset_count,
             "local_only": s.local_only,
@@ -79,6 +80,8 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
             "external_ready": bool(external_sync.get("ready")),
             "archive_count": cat.count_ready("archive"),
             "library_count": cat.count_ready("library"),
+            "library_mount_required": s.library_mount_required,
+            "library_mounted": library_mounted,
             "sync": sync,
             "external_sync": external_sync,
             "paths": {
@@ -284,9 +287,11 @@ async def upload_library_assets(
     target_path: str = Form(""),
     relative_paths: str = Form("[]"),
 ) -> dict:
+    settings = get_settings()
+    if not library_mount_available(settings):
+        raise HTTPException(503, "素材盘未挂载，已禁止写入资源库")
     if not files or len(files) > 200:
         raise HTTPException(400, "每批必须上传 1 到 200 个文件")
-    settings = get_settings()
     catalog = Catalog(settings)
     base = _safe_library_target(settings.library_root, target_path)
     try:
@@ -543,6 +548,8 @@ def create_job(
     rule_ids: str = Form(""),
 ) -> dict:
     s = get_settings()
+    if not library_mount_available(s):
+        raise HTTPException(503, "素材盘未挂载，暂不接受打包任务")
     cat = Catalog(s)
     if s.local_only and cat.count_ready_all() == 0:
         raise HTTPException(409, "统一素材库暂无可用文件，请先完成同步或本地目录索引")

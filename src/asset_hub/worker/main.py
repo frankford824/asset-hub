@@ -10,7 +10,7 @@ from collections import Counter, OrderedDict
 from pathlib import Path
 
 from asset_hub.catalog.db import Catalog
-from asset_hub.config import ensure_data_dirs
+from asset_hub.config import ensure_data_dirs, library_mount_available
 from asset_hub.jobs import JobStore
 from asset_hub.pack.excel import (
     ExcelRow,
@@ -51,6 +51,15 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
     job = store.get(job_id)
     if not job:
         return
+    if not library_mount_available(settings):
+        store.update(
+            job_id,
+            status="failed",
+            error="素材盘未挂载，任务已停止且未生成缺失清单",
+            progress={"percent": 0, "label": "素材盘离线"},
+            finished=True,
+        )
+        return
     job_dir = store.job_dir(job_id)
     excel_path = next(
         (path for path in job_dir.iterdir() if path.suffix.lower() in {".xlsx", ".xls"}),
@@ -83,6 +92,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         matched, missing = match_assets_for_rows(
             catalog, rows, rule_handlers=handlers
         )
+        if not library_mount_available(settings):
+            raise RuntimeError("素材盘在匹配过程中离线，任务已停止")
         timings["match_s"] = round(time.perf_counter() - phase_started, 4)
         matched_by_row = {block["row"].row_index: block for block in matched}
         missing_by_row = {item["row"].row_index: item for item in missing}

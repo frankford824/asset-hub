@@ -167,15 +167,18 @@ install_systemd() {
   fi
   log "安装 systemd 单元"
   local unit
-  for unit in asset-hub-api.service asset-hub-worker.service \
+  for unit in asset-hub-library-mount.service \
+              asset-hub-api.service asset-hub-worker.service \
               asset-hub-sync.service asset-hub-sync.timer \
               asset-hub-index.service asset-hub-index.timer; do
     render_unit "${ASSET_HUB_ROOT}/deploy/systemd/${unit}" \
       "/etc/systemd/system/${unit}"
   done
   systemctl daemon-reload
-  systemctl enable asset-hub-api.service asset-hub-worker.service \
+  systemctl enable asset-hub-library-mount.service \
+    asset-hub-api.service asset-hub-worker.service \
     asset-hub-sync.timer asset-hub-index.timer
+  systemctl restart asset-hub-library-mount.service || true
   systemctl restart asset-hub-api.service asset-hub-worker.service || true
   systemctl start asset-hub-sync.timer asset-hub-index.timer || true
 }

@@ -710,6 +710,43 @@ def test_create_job_allows_library_fallback_before_sync_complete(settings):
     assert response.json()["unique_rows"] == 1
 
 
+def test_create_job_rejects_when_library_mount_is_offline(settings, monkeypatch):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["SKU编码"])
+    sheet.append(["HQT05099"])
+    payload = BytesIO()
+    workbook.save(payload)
+
+    from asset_hub.api import main as api_main
+
+    monkeypatch.setattr(api_main, "library_mount_available", lambda _settings: False)
+    response = TestClient(api_main.app).post(
+        "/api/v1/jobs",
+        files={
+            "file": (
+                "offline.xlsx",
+                payload.getvalue(),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert response.status_code == 503
+    assert "素材盘未挂载" in response.json()["detail"]
+
+
+def test_worker_fails_closed_when_library_mount_is_offline(settings, monkeypatch):
+    store = JobStore(settings)
+    job = store.create(filename="offline.xlsx")
+    from asset_hub.worker import main as worker_main
+
+    monkeypatch.setattr(worker_main, "library_mount_available", lambda _settings: False)
+    worker_main.process_job(store, Catalog(settings), job.id)
+    failed = store.get(job.id)
+    assert failed is not None and failed.status == "failed"
+    assert "未生成缺失清单" in failed.error
+
+
 def test_library_upload_tree_and_global_filename_dedupe(settings):
     from asset_hub.api.main import app
 
