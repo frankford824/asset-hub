@@ -32,7 +32,8 @@ fstype="$(blkid -s TYPE -o value "$device")"
 [[ "$fstype" == "ntfs" ]] || { log "refusing repair for non-NTFS device: $fstype"; exit 1; }
 
 kernel_name="$(basename "$(readlink -f "$device")")"
-if ! journalctl -k -b --no-pager | grep -Fq "ntfs3(${kernel_name}): volume is dirty"; then
+kernel_log="$(journalctl -k -b --no-pager)"
+if ! grep -Fq "ntfs3(${kernel_name}): volume is dirty" <<<"$kernel_log"; then
   log "mount failed for a reason other than an NTFS dirty volume; manual inspection required"
   exit 1
 fi
