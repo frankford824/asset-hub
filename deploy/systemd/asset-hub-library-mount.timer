@@ -1,0 +1,12 @@
+[Unit]
+Description=periodically verify the asset-hub library mount
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=asset-hub-library-mount.service
+
+[Install]
+WantedBy=timers.target

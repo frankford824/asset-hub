@@ -6,7 +6,6 @@ Before=asset-hub-worker.service asset-hub-sync.service asset-hub-index.service
 [Service]
 Type=oneshot
 ExecStart=/opt/asset-hub/deploy/ensure-library-mount.sh
-RemainAfterExit=yes
 TimeoutStartSec=10min
 
 [Install]

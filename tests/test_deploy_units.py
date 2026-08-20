@@ -97,6 +97,15 @@ def test_mount_guard_repairs_only_a_confirmed_dirty_ntfs_volume():
     assert "mount -o force" not in guard
 
 
+def test_mount_guard_is_rechecked_every_minute():
+    timer = (ROOT / "deploy/systemd/asset-hub-library-mount.timer").read_text()
+    service = (ROOT / "deploy/systemd/asset-hub-library-mount.service").read_text()
+
+    assert "OnUnitInactiveSec=60s" in timer
+    assert "Persistent=true" in timer
+    assert "RemainAfterExit" not in service
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 
