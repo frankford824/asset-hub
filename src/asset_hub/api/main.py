@@ -60,6 +60,7 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
         cat = Catalog(s)
         sync = cat.get_sync_state("finalized")
         external_sync = cat.get_sync_state("external")
+        external_follow = cat.get_sync_state("external_follow")
         asset_count = cat.count_ready_all()
         library_mounted = library_mount_available(s)
         required_sync_states = [sync]
@@ -84,6 +85,7 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
             "library_mounted": library_mounted,
             "sync": sync,
             "external_sync": external_sync,
+            "external_follow": external_follow,
             "paths": {
                 "data_root": str(s.data_root),
                 "finalized": str(s.finalized_dir),

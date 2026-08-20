@@ -25,6 +25,11 @@ asset-hub/
 | 配置 | `/etc/asset-hub/config.yaml` | `ASSET_HUB_CONFIG` |
 | 既有本地素材目录 | `/home/resourse` | `ASSET_HUB_LIBRARY` |
 
+生产配置启用 `library_mount_required: true`。`asset-hub-library-mount.timer`
+每分钟验证素材盘；正常挂载失败且内核明确报告目标 NTFS 卷为 dirty 时，守护进程才会对
+fstab 解析出的精确块设备运行 `ntfsfix`/`ntfsfix -d` 并重试挂载。不会使用
+`mount -o force`。恢复失败时 API 拒绝新打包，worker/sync/index 也不会生成假缺失结果。
+
 ## 安装（在 ybyc）
 
 ```bash
@@ -67,6 +72,8 @@ HTTP provider 分开消费 `yongboWorkflow` 的 finalized 业务终稿与 extern
 - `GET /v1/integration/asset-sync/finalized/manifest`
 - `POST /v1/integration/asset-sync/finalized/download-tickets`
 - `GET /v1/integration/asset-sync/external-current/manifest`
+- `GET /v1/integration/asset-sync/external-current/head`
+- `GET /v1/integration/asset-sync/external-current/changes`
 - `POST /v1/integration/asset-sync/external-current/download-tickets`
 - 鉴权头：`X-Asset-Sync-Token`
 - Manifest 使用弱 ETag；客户端保存 ETag，并在后续请求发送 `If-None-Match`。
@@ -84,6 +91,11 @@ external-current 以线上 source fingerprint、相对路径、大小和 OSS tic
 已有 `/home/resourse` 文件在路径、大小和源修改时间一致时直接复用，不重复产生
 OSS 下行；新增或替换文件才写入本地镜像。线上 missing 路径作为 tombstone 覆盖
 旧 library 候选，避免索引定时器把已替换旧图重新选回。
+
+首次启动按 `head → 完整 manifest → 从 pre-head 回放 changes` 切换；之后每10秒拉取一次
+轻量变更feed，只有catalog、ticket和原子文件写入全部成功才推进 cursor。正常NAS事件
+通常在几十秒内可用于搜索和打包。原有5分钟完整manifest继续作为权威对账，修复极端
+时间戳边界或长时间断网造成的增量遗漏。
 
 ## 统一素材库
 

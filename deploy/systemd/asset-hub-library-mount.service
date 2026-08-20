@@ -1,7 +1,7 @@
 [Unit]
 Description=asset-hub library disk mount guard
 After=local-fs.target
-Before=asset-hub-worker.service asset-hub-sync.service asset-hub-index.service
+Before=asset-hub-worker.service asset-hub-sync.service asset-hub-external-follow.service asset-hub-index.service
 
 [Service]
 Type=oneshot

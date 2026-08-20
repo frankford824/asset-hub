@@ -16,6 +16,8 @@ from asset_hub.config import Settings
 MANIFEST_PATH = "/v1/integration/asset-sync/finalized/manifest"
 TICKETS_PATH = "/v1/integration/asset-sync/finalized/download-tickets"
 EXTERNAL_MANIFEST_PATH = "/v1/integration/asset-sync/external-current/manifest"
+EXTERNAL_HEAD_PATH = "/v1/integration/asset-sync/external-current/head"
+EXTERNAL_CHANGES_PATH = "/v1/integration/asset-sync/external-current/changes"
 EXTERNAL_TICKETS_PATH = "/v1/integration/asset-sync/external-current/download-tickets"
 
 
@@ -136,12 +138,33 @@ class ExternalDownloadTicket:
     mock_seed: str = ""
 
 
+@dataclass(frozen=True)
+class ExternalSyncHead:
+    cursor: str
+    observed_at: float = 0.0
+
+
+@dataclass(frozen=True)
+class ExternalChangesResult:
+    cursor: str
+    next_cursor: str
+    has_more: bool
+    items: list[ExternalManifestItem] = field(default_factory=list)
+    generated_at: float = 0.0
+
+
 class SyncProvider(Protocol):
     def get_manifest(self, etag: str = "") -> ManifestResult: ...
 
     def get_download_tickets(self, task_asset_ids: list[int]) -> list[DownloadTicket]: ...
 
     def get_external_manifest(self, etag: str = "") -> ExternalManifestResult: ...
+
+    def get_external_sync_head(self) -> ExternalSyncHead: ...
+
+    def get_external_changes(
+        self, cursor: str, *, limit: int = 500, wait_seconds: int = 0
+    ) -> ExternalChangesResult: ...
 
     def get_external_download_tickets(
         self, external_asset_ids: list[int]
@@ -260,6 +283,18 @@ class MockProvider:
             manifest_id=manifest_id,
             etag=response_etag,
             not_modified=bool(etag and _etag_manifest_id(etag) == manifest_id),
+        )
+
+    def get_external_sync_head(self) -> ExternalSyncHead:
+        return ExternalSyncHead(cursor="mock-external-head", observed_at=time.time())
+
+    def get_external_changes(
+        self, cursor: str, *, limit: int = 500, wait_seconds: int = 0
+    ) -> ExternalChangesResult:
+        return ExternalChangesResult(
+            cursor=cursor or "mock-external-head",
+            next_cursor=cursor or "mock-external-head",
+            has_more=False,
         )
 
     def get_external_download_tickets(
@@ -514,6 +549,53 @@ class HttpProvider:
             deleted_count=deleted_count,
         )
 
+    def get_external_sync_head(self) -> ExternalSyncHead:
+        response = self._client.get(EXTERNAL_HEAD_PATH)
+        response.raise_for_status()
+        raw = _response_data(response)
+        if int(raw.get("schema_version") or 0) != 1:
+            raise ValueError("unsupported external head schema_version")
+        cursor = str(raw.get("cursor") or "").strip()
+        if not cursor:
+            raise ValueError("external head cursor is required")
+        return ExternalSyncHead(
+            cursor=cursor,
+            observed_at=_timestamp(raw.get("observed_at")),
+        )
+
+    def get_external_changes(
+        self, cursor: str, *, limit: int = 500, wait_seconds: int = 0
+    ) -> ExternalChangesResult:
+        if not 1 <= limit <= 500:
+            raise ValueError("external changes limit must be between 1 and 500")
+        if not 0 <= wait_seconds <= 30:
+            raise ValueError("external changes wait_seconds must be between 0 and 30")
+        response = self._client.get(
+            EXTERNAL_CHANGES_PATH,
+            params={"cursor": cursor, "limit": limit, "wait_seconds": wait_seconds},
+            timeout=max(self.settings.http.timeout_sec, wait_seconds + 10),
+        )
+        response.raise_for_status()
+        raw = _response_data(response)
+        if int(raw.get("schema_version") or 0) != 1:
+            raise ValueError("unsupported external changes schema_version")
+        response_cursor = str(raw.get("cursor") or "").strip()
+        next_cursor = str(raw.get("next_cursor") or "").strip()
+        if not response_cursor or not next_cursor:
+            raise ValueError("external changes cursors are required")
+        if cursor and response_cursor != cursor:
+            raise ValueError("external changes response cursor differs from request")
+        items, _active, _deleted, _bytes = _parse_external_items(raw.get("items") or [])
+        if items and next_cursor == response_cursor:
+            raise ValueError("external changes did not advance for a non-empty batch")
+        return ExternalChangesResult(
+            cursor=response_cursor,
+            next_cursor=next_cursor,
+            has_more=bool(raw.get("has_more")),
+            items=items,
+            generated_at=_timestamp(raw.get("generated_at")),
+        )
+
     def get_external_download_tickets(
         self, external_asset_ids: list[int]
     ) -> list[ExternalDownloadTicket]:
@@ -563,6 +645,60 @@ def _response_data(response: httpx.Response) -> dict:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
         raise ValueError("expected JSON response envelope with data object")
     return payload["data"]
+
+
+def _parse_external_items(
+    raw_items: list[dict],
+) -> tuple[list[ExternalManifestItem], int, int, int]:
+    items: list[ExternalManifestItem] = []
+    ids: set[int] = set()
+    paths: set[str] = set()
+    active_count = deleted_count = total_bytes = 0
+    for raw_item in raw_items:
+        external_asset_id = int(raw_item.get("external_asset_id") or 0)
+        relative_path = str(raw_item.get("relative_path") or "").strip()
+        file_name = str(raw_item.get("file_name") or "").strip()
+        file_size = int(raw_item.get("file_size") or 0)
+        storage_key = str(raw_item.get("storage_key") or "").strip()
+        deleted = bool(raw_item.get("deleted"))
+        path_value = PurePosixPath(relative_path)
+        if (
+            external_asset_id <= 0
+            or not relative_path
+            or path_value.is_absolute()
+            or ".." in path_value.parts
+            or not file_name
+            or file_size < 0
+        ):
+            raise ValueError(f"invalid external manifest item={external_asset_id}")
+        if external_asset_id in ids or relative_path in paths:
+            raise ValueError("external manifest IDs and relative paths must be unique")
+        if deleted and storage_key:
+            raise ValueError("deleted external manifest item carries storage_key")
+        if not deleted and not storage_key:
+            raise ValueError("active external manifest item is missing storage_key")
+        ids.add(external_asset_id)
+        paths.add(relative_path)
+        if deleted:
+            deleted_count += 1
+        else:
+            active_count += 1
+            total_bytes += file_size
+        items.append(
+            ExternalManifestItem(
+                external_asset_id=external_asset_id,
+                origin_path_hash=str(raw_item.get("origin_path_hash") or ""),
+                relative_path=relative_path,
+                file_name=file_name,
+                mime_type=str(raw_item.get("mime_type") or ""),
+                file_size=file_size,
+                storage_key=storage_key,
+                source_modified_at=_timestamp(raw_item.get("source_modified_at")),
+                record_updated_at=_timestamp(raw_item.get("record_updated_at")),
+                deleted=deleted,
+            )
+        )
+    return items, active_count, deleted_count, total_bytes
 
 
 def _optional_int(value: object) -> int | None:

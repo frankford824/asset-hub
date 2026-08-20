@@ -24,6 +24,7 @@ dependencies = [
 asset-hub-api = "asset_hub.api.main:run"
 asset-hub-worker = "asset_hub.worker.main:run"
 asset-hub-sync = "asset_hub.sync.main:run"
+asset-hub-external-follow = "asset_hub.sync.main:run_external_follow"
 asset-hub-index = "asset_hub.catalog.index:run"
 
 [tool.setuptools.packages.find]

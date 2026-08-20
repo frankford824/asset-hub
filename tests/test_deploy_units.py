@@ -79,6 +79,7 @@ def test_data_consumers_require_the_library_mount_guard():
     for name in (
         "asset-hub-worker.service",
         "asset-hub-sync.service",
+        "asset-hub-external-follow.service",
         "asset-hub-index.service",
     ):
         unit = (ROOT / "deploy/systemd" / name).read_text()
@@ -112,3 +113,12 @@ def test_sync_timer_waits_from_completion():
 
     assert "OnUnitInactiveSec=5min" in timer
     assert "OnUnitActiveSec" not in timer
+
+
+def test_external_follow_timer_runs_every_ten_seconds_under_the_catalog_lock():
+    timer = (ROOT / "deploy/systemd/asset-hub-external-follow.timer").read_text()
+    service = (ROOT / "deploy/systemd/asset-hub-external-follow.service").read_text()
+
+    assert "OnUnitInactiveSec=10s" in timer
+    assert "/run/asset-hub/catalog.lock" in service
+    assert "asset-hub-external-follow" in service

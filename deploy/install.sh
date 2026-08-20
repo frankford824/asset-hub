@@ -171,6 +171,7 @@ install_systemd() {
   for unit in asset-hub-library-mount.service asset-hub-library-mount.timer \
               asset-hub-api.service asset-hub-worker.service \
               asset-hub-sync.service asset-hub-sync.timer \
+              asset-hub-external-follow.service asset-hub-external-follow.timer \
               asset-hub-index.service asset-hub-index.timer; do
     render_unit "${ASSET_HUB_ROOT}/deploy/systemd/${unit}" \
       "/etc/systemd/system/${unit}"
@@ -178,11 +179,11 @@ install_systemd() {
   systemctl daemon-reload
   systemctl enable asset-hub-library-mount.service asset-hub-library-mount.timer \
     asset-hub-api.service asset-hub-worker.service \
-    asset-hub-sync.timer asset-hub-index.timer
+    asset-hub-sync.timer asset-hub-external-follow.timer asset-hub-index.timer
   systemctl restart asset-hub-library-mount.service || true
   systemctl restart asset-hub-library-mount.timer || true
   systemctl restart asset-hub-api.service asset-hub-worker.service || true
-  systemctl start asset-hub-sync.timer asset-hub-index.timer || true
+  systemctl start asset-hub-sync.timer asset-hub-external-follow.timer asset-hub-index.timer || true
 }
 
 install_nginx() {

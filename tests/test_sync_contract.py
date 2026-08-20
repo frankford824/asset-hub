@@ -5,13 +5,14 @@ import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 from asset_hub.catalog.db import Catalog
 from asset_hub.config import ensure_data_dirs, get_settings
 from asset_hub.catalog.db import AssetRow
-from asset_hub.sync.main import sync_external_once, sync_once
+from asset_hub.sync.main import sync_external_follow_once, sync_external_once, sync_once
 
 
 def _manifest(manifest_id: str, object_ids: list[int]) -> dict:
@@ -106,6 +107,23 @@ class ContractStub:
         self.ticket_status: dict[int, dict] = {}
         self.external_manifest = _external_manifest("external-v1")
         self.external_etag = 'W/"external-v1"'
+        self.external_head_cursor = "cursor-head"
+        self.external_next_cursor = "cursor-next"
+        self.external_change_items = [
+            {
+                "external_asset_id": 703,
+                "origin_path_hash": "c" * 64,
+                "relative_path": "1/KT/HSC40500.jpg",
+                "file_name": "HSC40500.jpg",
+                "mime_type": "image/jpeg",
+                "file_size": len(b"external-object-703"),
+                "storage_key": "external/703.jpg",
+                "source_modified_at": "2026-08-20T10:00:00Z",
+                "record_updated_at": "2026-08-20T10:00:01Z",
+                "deleted": False,
+            }
+        ]
+        self.external_ticket_status: dict[int, str] = {}
         self.requests: list[tuple[str, str, str]] = []
         self.ticket_batches: list[list[int]] = []
         self.external_ticket_batches: list[list[int]] = []
@@ -130,6 +148,8 @@ class ContractStub:
 
             def do_GET(self):
                 token = self.headers.get("X-Asset-Sync-Token", "")
+                parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
                 state.requests.append(
                     (self.command, self.path, self.headers.get("If-None-Match", ""))
                 )
@@ -144,7 +164,49 @@ class ContractStub:
                         return
                     self._json(200, {"data": state.manifest}, etag=state.etag)
                     return
-                if self.path.endswith("/external-current/manifest"):
+                if parsed.path.endswith("/external-current/head"):
+                    if token != "contract-secret":
+                        self._json(401, {"error": "unauthorized"})
+                        return
+                    self._json(
+                        200,
+                        {
+                            "data": {
+                                "schema_version": 1,
+                                "cursor": state.external_head_cursor,
+                                "observed_at": "2026-08-20T10:00:00Z",
+                            }
+                        },
+                    )
+                    return
+                if parsed.path.endswith("/external-current/changes"):
+                    if token != "contract-secret":
+                        self._json(401, {"error": "unauthorized"})
+                        return
+                    cursor = (query.get("cursor") or [""])[0]
+                    items = (
+                        state.external_change_items
+                        if cursor == state.external_head_cursor
+                        else []
+                    )
+                    next_cursor = (
+                        state.external_next_cursor if items else (cursor or state.external_head_cursor)
+                    )
+                    self._json(
+                        200,
+                        {
+                            "data": {
+                                "schema_version": 1,
+                                "cursor": cursor or state.external_head_cursor,
+                                "next_cursor": next_cursor,
+                                "has_more": False,
+                                "generated_at": "2026-08-20T10:00:02Z",
+                                "items": items,
+                            }
+                        },
+                    )
+                    return
+                if parsed.path.endswith("/external-current/manifest"):
                     if token != "contract-secret":
                         self._json(401, {"error": "unauthorized"})
                         return
@@ -159,16 +221,16 @@ class ContractStub:
                         etag=state.external_etag,
                     )
                     return
-                if self.path.startswith("/objects/"):
-                    task_asset_id = int(self.path.rsplit("/", 1)[-1])
+                if parsed.path.startswith("/objects/"):
+                    task_asset_id = int(parsed.path.rsplit("/", 1)[-1])
                     body = f"object-{task_asset_id}".encode()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
                     self.wfile.write(body)
                     return
-                if self.path.startswith("/external-objects/"):
-                    external_asset_id = int(self.path.rsplit("/", 1)[-1])
+                if parsed.path.startswith("/external-objects/"):
+                    external_asset_id = int(parsed.path.rsplit("/", 1)[-1])
                     body = f"external-object-{external_asset_id}".encode()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
@@ -192,15 +254,35 @@ class ContractStub:
                     base_url = f"http://127.0.0.1:{state.server.server_port}"
                     results = []
                     for external_asset_id in ids:
+                        status = state.external_ticket_status.get(external_asset_id, "ready")
+                        if status != "ready":
+                            results.append(
+                                {
+                                    "external_asset_id": external_asset_id,
+                                    "status": status,
+                                    "retryable": status == "error",
+                                    "error_message": "temporary" if status == "error" else "",
+                                }
+                            )
+                            continue
                         size = len(f"external-object-{external_asset_id}".encode())
+                        records = [
+                            *state.external_manifest["items"],
+                            *state.external_change_items,
+                        ]
+                        record = next(
+                            item
+                            for item in records
+                            if item["external_asset_id"] == external_asset_id
+                        )
                         results.append(
                             {
                                 "external_asset_id": external_asset_id,
                                 "status": "ready",
                                 "origin_path_hash": "a" * 64,
-                                "relative_path": "1/KT/HQT11799——new/上面.jpg",
-                                "file_name": "上面.jpg",
-                                "storage_key": f"external/{external_asset_id}.jpg",
+                                "relative_path": record["relative_path"],
+                                "file_name": record["file_name"],
+                                "storage_key": record["storage_key"],
                                 "expected_size": size,
                                 "actual_size": size,
                                 "etag": f"external-etag-{external_asset_id}",
@@ -381,6 +463,48 @@ def test_external_overlay_downloads_replacement_and_suppresses_tombstoned_librar
         replaced = sync_external_once()
         assert replaced["written"] == 1
         assert stub.external_ticket_batches == [[701], [701]]
+
+
+def test_external_follow_bootstraps_then_applies_only_changes(http_settings):
+    with ContractStub() as stub:
+        settings = http_settings(
+            f"http://127.0.0.1:{stub.server.server_port}", "[external]"
+        )
+        stats = sync_external_follow_once()
+        assert stats["bootstrapped"] is True
+        assert stats["items"] == 1
+        assert stats["written"] == 1
+        assert stats["sync_complete"] is True
+
+        catalog = Catalog(settings)
+        followed = catalog.get_asset("external:703")
+        assert followed is not None and followed.status == "ready"
+        assert Path(followed.local_path).read_bytes() == b"external-object-703"
+        assert catalog.get_asset("external:701").status == "ready"
+        assert catalog.get_sync_state("external_follow")["cursor"] == "cursor-next"
+
+        empty = sync_external_follow_once()
+        assert empty["bootstrapped"] is False
+        assert empty["items"] == 0
+        assert empty["requested"] == 0
+        assert empty["sync_complete"] is True
+
+
+def test_external_follow_replays_cursor_after_ticket_failure(http_settings):
+    with ContractStub() as stub:
+        settings = http_settings(
+            f"http://127.0.0.1:{stub.server.server_port}", "[external]"
+        )
+        stub.external_ticket_status[703] = "error"
+        failed = sync_external_follow_once()
+        assert failed["sync_complete"] is False
+        assert Catalog(settings).get_sync_state("external_follow")["cursor"] == "cursor-head"
+
+        stub.external_ticket_status.pop(703)
+        recovered = sync_external_follow_once()
+        assert recovered["sync_complete"] is True
+        assert recovered["written"] == 1
+        assert Catalog(settings).get_sync_state("external_follow")["cursor"] == "cursor-next"
 
 
 def test_retryable_ticket_error_keeps_sync_not_ready_then_retries_304(http_settings):

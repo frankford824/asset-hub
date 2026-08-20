@@ -1008,6 +1008,17 @@ class Catalog:
         self, items: Sequence[Any], manifest_id: str
     ) -> dict[str, int]:
         """Apply the current external overlay without deleting retained files."""
+        return self._apply_external_items(items, manifest_id, full_snapshot=True)
+
+    def apply_external_changes(
+        self, items: Sequence[Any], manifest_id: str
+    ) -> dict[str, int]:
+        """Apply an incremental batch without tombstoning unseen external rows."""
+        return self._apply_external_items(items, manifest_id, full_snapshot=False)
+
+    def _apply_external_items(
+        self, items: Sequence[Any], manifest_id: str, *, full_snapshot: bool
+    ) -> dict[str, int]:
         active = deleted = pending = reused = changed = unchanged = 0
         seen: set[str] = set()
         with self.connect() as conn:
@@ -1126,19 +1137,20 @@ class Catalog:
                             (asset_id,),
                         )
             exited = 0
-            for asset_id, previous in existing.items():
-                if asset_id in seen or int(previous["deleted"] or 0):
-                    continue
-                conn.execute(
-                    "UPDATE assets SET deleted=1,status='tombstone',retryable=0,last_error='manifest_exit',manifest_id=? WHERE asset_id=?",
-                    (manifest_id, asset_id),
-                )
-                conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
-                conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
-                conn.execute(
-                    "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
-                )
-                exited += 1
+            if full_snapshot:
+                for asset_id, previous in existing.items():
+                    if asset_id in seen or int(previous["deleted"] or 0):
+                        continue
+                    conn.execute(
+                        "UPDATE assets SET deleted=1,status='tombstone',retryable=0,last_error='manifest_exit',manifest_id=? WHERE asset_id=?",
+                        (manifest_id, asset_id),
+                    )
+                    conn.execute("DELETE FROM assets_fts WHERE asset_id=?", (asset_id,))
+                    conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset_id,))
+                    conn.execute(
+                        "DELETE FROM asset_name_claims WHERE asset_id=?", (asset_id,)
+                    )
+                    exited += 1
         return {
             "items": len(seen),
             "active": active,

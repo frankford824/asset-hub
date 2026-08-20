@@ -1,0 +1,22 @@
+[Unit]
+Description=asset-hub low-latency external asset follower
+After=network-online.target
+After=asset-hub-library-mount.service
+Wants=network-online.target
+Requires=asset-hub-library-mount.service
+
+[Service]
+Type=oneshot
+User=ybyc
+Group=asset-hub
+Environment=ASSET_HUB_CONFIG=/etc/asset-hub/config.yaml
+Environment=ASSET_HUB_ROOT=/opt/asset-hub
+WorkingDirectory=/opt/asset-hub
+RuntimeDirectory=asset-hub
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/bin/flock --exclusive --wait 7200 /run/asset-hub/catalog.lock /opt/asset-hub/.venv/bin/asset-hub-external-follow
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true

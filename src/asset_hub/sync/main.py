@@ -12,7 +12,7 @@ import httpx
 
 from asset_hub.catalog.db import AssetRow, Catalog, local_path_for_kind
 from asset_hub.catalog.ignore import should_ignore
-from asset_hub.config import ensure_data_dirs, get_settings
+from asset_hub.config import ensure_data_dirs, get_settings, library_mount_available
 from asset_hub.sync.provider import (
     DownloadTicket,
     ExternalDownloadTicket,
@@ -646,6 +646,181 @@ def sync_external_once(provider: SyncProvider | None = None) -> dict:
     return stats
 
 
+def _external_change_ready(catalog: Catalog, item) -> bool:
+    asset = catalog.get_asset(f"external:{int(item.external_asset_id)}")
+    if asset is None:
+        return False
+    if item.deleted:
+        return bool(asset.deleted and asset.status == "tombstone")
+    if asset.deleted or asset.status != "ready" or not asset.local_path:
+        return False
+    path = Path(asset.local_path)
+    return path.is_file() and path.stat().st_size == asset.file_size
+
+
+def _process_external_change_tickets(
+    provider: SyncProvider,
+    catalog: Catalog,
+    items: list,
+    settings,
+    stats: dict,
+) -> bool:
+    active_ids = {
+        int(item.external_asset_id) for item in items if not bool(item.deleted)
+    }
+    pending = []
+    for external_asset_id in active_ids:
+        asset = catalog.get_asset(f"external:{external_asset_id}")
+        if asset is None:
+            stats["error"] += 1
+            continue
+        local_valid = bool(
+            asset.local_path
+            and Path(asset.local_path).is_file()
+            and Path(asset.local_path).stat().st_size == asset.file_size
+        )
+        if asset.status != "ready" or asset.retryable or not local_valid:
+            pending.append(asset)
+    stats["requested"] += len(pending)
+    for offset in range(0, len(pending), settings.sync.ticket_batch_size):
+        batch = pending[offset : offset + settings.sync.ticket_batch_size]
+        ids = [int(asset.asset_id.split(":", 1)[1]) for asset in batch]
+        try:
+            tickets = provider.get_external_download_tickets(ids)
+            ticket_by_id = {ticket.external_asset_id: ticket for ticket in tickets}
+            if set(ticket_by_id) - set(ids):
+                raise ValueError("external ticket response contains unexpected IDs")
+        except Exception as exc:
+            stats["error"] += len(batch)
+            stats["retryable_error"] += len(batch)
+            for asset in batch:
+                catalog.mark_asset_status(
+                    asset.asset_id, "error", retryable=True, error=str(exc)
+                )
+            log.exception("external follow ticket batch failed ids=%s", ids)
+            continue
+        for asset in batch:
+            external_asset_id = int(asset.asset_id.split(":", 1)[1])
+            ticket = ticket_by_id.get(external_asset_id)
+            if ticket is None:
+                stats["error"] += 1
+                stats["retryable_error"] += 1
+                catalog.mark_asset_status(
+                    asset.asset_id,
+                    "error",
+                    retryable=True,
+                    error="ticket response omitted requested external_asset_id",
+                )
+                continue
+            _process_external_ticket(catalog, asset, ticket, settings, stats)
+    return stats["error"] == 0 and all(
+        _external_change_ready(catalog, item) for item in items
+    )
+
+
+def sync_external_follow_once(provider: SyncProvider | None = None) -> dict:
+    """Consume replayable external changes; full sync remains the recovery authority."""
+    settings = ensure_data_dirs()
+    catalog = Catalog(settings)
+    state = catalog.get_sync_state("external_follow")
+    stats = {
+        "bootstrapped": False,
+        "pages": 0,
+        "items": 0,
+        "changed": 0,
+        "unchanged": 0,
+        "requested": 0,
+        "ready": 0,
+        "written": 0,
+        "skipped": 0,
+        "missing": 0,
+        "size_mismatch": 0,
+        "not_current": 0,
+        "error": 0,
+        "retryable_error": 0,
+        "tombstone": 0,
+        "has_more": False,
+        "sync_complete": False,
+    }
+    if not library_mount_available(settings):
+        stats["error"] = 1
+        catalog.set_sync_state(
+            "external_follow",
+            ready=False,
+            error="library mount is offline",
+            stats_json=json.dumps(stats, ensure_ascii=False),
+        )
+        return stats
+    try:
+        provider = provider or build_provider(settings)
+        cursor = str(state.get("cursor") or "")
+        if not cursor:
+            head = provider.get_external_sync_head()
+            full = sync_external_once(provider)
+            if not full.get("sync_complete"):
+                raise RuntimeError("external full bootstrap is incomplete")
+            cursor = head.cursor
+            stats["bootstrapped"] = True
+            catalog.set_sync_state(
+                "external_follow", cursor=cursor, ready=True, error="", success=True
+            )
+
+        manifest_id = str(catalog.get_sync_state("external").get("manifest_id") or "")
+        if not manifest_id:
+            raise RuntimeError("external full manifest state is missing")
+        for _page in range(100):
+            changes = provider.get_external_changes(cursor, limit=500, wait_seconds=0)
+            filtered = [
+                item
+                for item in changes.items
+                if not should_ignore(item.file_name, settings.sync.ignore_globs)
+            ]
+            snapshot = catalog.apply_external_changes(filtered, manifest_id)
+            stats["pages"] += 1
+            stats["items"] += len(filtered)
+            stats["changed"] += snapshot["changed"]
+            stats["unchanged"] += snapshot["unchanged"]
+            stats["tombstone"] += snapshot["deleted"]
+            if not _process_external_change_tickets(
+                provider, catalog, filtered, settings, stats
+            ):
+                raise RuntimeError("external change batch was not durably applied")
+            cursor = changes.next_cursor
+            catalog.set_sync_state(
+                "external_follow",
+                cursor=cursor,
+                ready=True,
+                error="",
+                stats_json=json.dumps(stats, ensure_ascii=False),
+                success=True,
+            )
+            stats["has_more"] = changes.has_more
+            if not changes.has_more:
+                break
+        else:
+            raise RuntimeError("external change feed exceeded 100 pages")
+        stats["sync_complete"] = True
+        catalog.set_sync_state(
+            "external_follow",
+            cursor=cursor,
+            ready=True,
+            error="",
+            stats_json=json.dumps(stats, ensure_ascii=False),
+            success=True,
+        )
+    except Exception as exc:
+        stats["error"] += int(stats["error"] == 0)
+        catalog.set_sync_state(
+            "external_follow",
+            ready=False,
+            error=str(exc),
+            stats_json=json.dumps(stats, ensure_ascii=False),
+        )
+        log.exception("external follow failed")
+    log.info("sync external follow stats=%s", stats)
+    return stats
+
+
 def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -658,6 +833,16 @@ def run() -> None:
     finalized_stats = sync_once(provider) if "finalized" in settings.sync.kinds else {"ready_for_pack": True}
     external_stats = sync_external_once(provider) if "external" in settings.sync.kinds else {"sync_complete": True}
     if not finalized_stats["ready_for_pack"] or not external_stats["sync_complete"]:
+        raise SystemExit(1)
+
+
+def run_external_follow() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    if not sync_external_follow_once().get("sync_complete"):
         raise SystemExit(1)
 
 
