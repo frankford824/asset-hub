@@ -2,6 +2,7 @@
 Description=asset-hub sync preheat (oneshot)
 After=network-online.target
 Wants=network-online.target
+RequiresMountsFor=/home/resourse
 
 [Service]
 Type=oneshot

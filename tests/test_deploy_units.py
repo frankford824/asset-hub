@@ -67,6 +67,16 @@ def test_deploy_preserves_nginx_traversal_permission():
     assert "sudo chmod 0751 ${ROOT}" in deploy
 
 
+def test_data_consumers_require_the_library_mount():
+    for name in (
+        "asset-hub-worker.service",
+        "asset-hub-sync.service",
+        "asset-hub-index.service",
+    ):
+        unit = (ROOT / "deploy/systemd" / name).read_text()
+        assert "RequiresMountsFor=/home/resourse" in unit
+
+
 def test_sync_timer_waits_from_completion():
     timer = (ROOT / "deploy/systemd/asset-hub-sync.timer").read_text()
 

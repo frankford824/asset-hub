@@ -2,6 +2,7 @@
 Description=asset-hub catalog / SKU index rebuild
 After=local-fs.target
 Wants=local-fs.target
+RequiresMountsFor=/home/resourse
 
 [Service]
 Type=oneshot
