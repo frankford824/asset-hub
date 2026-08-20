@@ -39,6 +39,7 @@ if ! grep -Fq "ntfs3(${kernel_name}): volume is dirty" <<<"$kernel_log"; then
 fi
 
 log "repairing dirty NTFS metadata on exact device $device"
+command -v ntfsfix >/dev/null || { log "ntfsfix is not installed"; exit 1; }
 ntfsfix "$device"
 ntfsfix -d "$device"
 

@@ -63,6 +63,7 @@ install_deps() {
     python3-venv \
     python3-pip \
     sqlite3 \
+    ntfs-3g \
     nginx \
     rsync \
     curl \

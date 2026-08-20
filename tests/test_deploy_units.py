@@ -93,6 +93,7 @@ def test_mount_guard_repairs_only_a_confirmed_dirty_ntfs_volume():
     assert '[[ -b "$device" ]]' in guard
     assert '[[ "$fstype" == "ntfs" ]]' in guard
     assert 'volume is dirty' in guard
+    assert "ntfs-3g" in (ROOT / "deploy/install.sh").read_text()
     assert 'ntfsfix -d "$device"' in guard
     assert "mount -o force" not in guard
 
