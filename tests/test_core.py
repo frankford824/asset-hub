@@ -115,6 +115,34 @@ def test_catalog_search_normalizes_and_reads_legacy_trailing_punctuation(setting
     assert [row.asset_id for row in hits] == [asset.asset_id]
 
 
+def test_catalog_search_hides_library_under_external_overlay(settings):
+    cat = Catalog(settings)
+    path = "1/KT/HSC38201-套装/上图.jpg"
+    cat.upsert_assets(
+        [
+            AssetRow(
+                asset_id="lib:overlay",
+                kind="library",
+                file_name="上图.jpg",
+                local_path="/tmp/library.jpg",
+                virtual_path=path,
+                status="ready",
+            ),
+            AssetRow(
+                asset_id="external:overlay",
+                kind="external",
+                file_name="上图.jpg",
+                local_path="/tmp/external.jpg",
+                virtual_path=path,
+                status="ready",
+            ),
+        ]
+    )
+
+    hits, total = cat.search("HSC38201")
+    assert total == 1
+    assert [row.asset_id for row in hits] == ["external:overlay"]
+
 def test_catalog_bulk_upsert(settings):
     cat = Catalog(settings)
     rows = [

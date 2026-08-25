@@ -1458,7 +1458,7 @@ class Catalog:
                 where = """a.deleted=0 AND a.status='ready'
                   AND NOT (a.kind='library' AND EXISTS (
                     SELECT 1 FROM assets e
-                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path
                   ))"""
                 args: list = []
                 if kind:
@@ -1493,7 +1493,7 @@ class Catalog:
               WHERE t.token IN ({token_placeholders}) AND a.deleted=0 AND a.status='ready'
                 AND NOT (a.kind='library' AND EXISTS (
                   SELECT 1 FROM assets e
-                   WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                   WHERE e.kind='external' AND e.virtual_path=a.virtual_path
                 ))
             """
             args = list(token_variants)
@@ -1534,7 +1534,7 @@ class Catalog:
                   WHERE f MATCH ? AND a.deleted=0 AND a.status='ready'
                     AND NOT (a.kind='library' AND EXISTS (
                       SELECT 1 FROM assets e
-                       WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                       WHERE e.kind='external' AND e.virtual_path=a.virtual_path
                     ))
                 """
                 args2: list = [fts_term]
@@ -1563,7 +1563,7 @@ class Catalog:
                   a.deleted=0 AND a.status='ready'
                   AND NOT (a.kind='library' AND EXISTS (
                     SELECT 1 FROM assets e
-                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
+                     WHERE e.kind='external' AND e.virtual_path=a.virtual_path
                   )) AND (
                     a.file_name LIKE ? OR a.original_filename LIKE ?
                     OR a.sku_code LIKE ? OR a.storage_key LIKE ?
