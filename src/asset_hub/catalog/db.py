@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_download_selections_created ON download_selection
 
 
 def normalize_sku_token(value: str) -> str:
-    return value.strip().upper()
+    return value.strip().upper().rstrip("-_.")
 
 
 def normalize_file_name(value: str) -> str:
@@ -1479,17 +1479,24 @@ class Catalog:
                 return [self._row_to_asset(r) for r in rows], total
 
             token = normalize_sku_token(q)
+            # Older catalog rows may retain filename punctuation immediately
+            # after a SKU (for example ``HSC11108-——...``). Keep exact-SKU
+            # lookup compatible while newly indexed tokens are normalized.
+            token_variants = list(
+                dict.fromkeys((token, f"{token}-", f"{token}_", f"{token}."))
+            )
+            token_placeholders = ",".join("?" for _ in token_variants)
             # exact SKU token first
-            base = """
+            base = f"""
               FROM assets a
               JOIN sku_tokens t ON t.asset_id=a.asset_id
-              WHERE t.token=? AND a.deleted=0 AND a.status='ready'
+              WHERE t.token IN ({token_placeholders}) AND a.deleted=0 AND a.status='ready'
                 AND NOT (a.kind='library' AND EXISTS (
                   SELECT 1 FROM assets e
                    WHERE e.kind='external' AND e.virtual_path=a.virtual_path AND e.deleted=1
                 ))
             """
-            args = [token]
+            args = list(token_variants)
             if kind:
                 base += " AND a.kind=?"
                 args.append(kind)

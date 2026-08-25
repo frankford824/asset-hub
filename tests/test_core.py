@@ -84,6 +84,37 @@ def test_catalog_search_sku(settings):
     assert hits[0][0].asset_id == "a1"
 
 
+def test_catalog_search_normalizes_and_reads_legacy_trailing_punctuation(settings):
+    cat = Catalog(settings)
+    asset = AssetRow(
+        asset_id="external:hyphenated-sku",
+        kind="external",
+        file_name="HSC11108-——常规KT板.jpg",
+        local_path="/tmp/HSC11108.jpg",
+        status="ready",
+    )
+    cat.upsert_asset(asset)
+    with cat.connect() as conn:
+        tokens = {
+            row["token"]
+            for row in conn.execute(
+                "SELECT token FROM sku_tokens WHERE asset_id=?", (asset.asset_id,)
+            ).fetchall()
+        }
+        assert "HSC11108" in tokens
+
+        # Simulate a row indexed before trailing punctuation normalization.
+        conn.execute("DELETE FROM sku_tokens WHERE asset_id=?", (asset.asset_id,))
+        conn.execute(
+            "INSERT INTO sku_tokens(token,asset_id) VALUES (?,?)",
+            ("HSC11108-", asset.asset_id),
+        )
+
+    hits, total = cat.search("HSC11108", kind="external")
+    assert total == 1
+    assert [row.asset_id for row in hits] == [asset.asset_id]
+
+
 def test_catalog_bulk_upsert(settings):
     cat = Catalog(settings)
     rows = [
