@@ -5,6 +5,7 @@ data_root: /var/lib/asset-hub
 local_only: true
 workers: 3
 pack_workers: 4       # 同时执行的打包任务数；额外任务进入独立WAL队列
+job_retention_hours: 24  # 打包结果保留 24 小时；至少保留最近 20 个终态任务
 provider: mock          # mock | http
 http:
   base_url: ""          # yongboWorkflow 服务根地址，例如 https://api.example.com
@@ -24,6 +25,7 @@ sync:
 api:
   host: 127.0.0.1
   port: 8080
+  x_accel: true       # 生产经 nginx 使用内部重定向；直连开发环境可设为 false
   workers: 4
   backlog: 2048
   limit_concurrency: 512

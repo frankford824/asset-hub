@@ -30,7 +30,25 @@ def test_nginx_download_path_uses_sendfile_without_directio():
     assert "reuseport backlog=4096" in nginx
     assert "keepalive 128" in nginx
     assert "sendfile_max_chunk 2m" in nginx
+    assert "proxy_buffering off" in nginx
+    assert "proxy_max_temp_file_size 0" in nginx
     assert "directio" not in nginx
+
+
+def test_api_service_forces_x_accel_downloads():
+    unit = (ROOT / "deploy/systemd/asset-hub-api.service").read_text()
+
+    assert "Environment=ASSET_HUB_X_ACCEL=1" in unit
+
+
+def test_scoped_passwordless_sudo_does_not_grant_all_commands():
+    script = (ROOT / "scripts/apply_asset_hub_ops_fix.sh").read_text()
+
+    assert "ASSET_HUB_OPERATIONS" in script
+    assert "NOPASSWD: ASSET_HUB_OPERATIONS" in script
+    assert "NOPASSWD: ALL" not in script
+    assert "visudo -cf" in script
+    assert "job_retention_hours: 24" in script
 
 
 def test_worker_pool_has_one_graceful_shutdown_deadline():

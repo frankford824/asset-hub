@@ -14,6 +14,8 @@ def test_settings_defaults(tmp_path, monkeypatch):
     s = load_settings(cfg)
     assert s.local_only is True
     assert s.provider == "mock"
+    assert s.job_retention_hours == 24
+    assert s.api.x_accel is True
     assert s.finalized_dir.as_posix().endswith("/finalized")
 
 

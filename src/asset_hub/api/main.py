@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from contextlib import asynccontextmanager
 
@@ -74,7 +75,9 @@ def _status_snapshot(max_age: float = 1.0) -> dict:
             "provider": s.provider,
             "workers": s.workers,
             "pack_workers": s.pack_workers,
+            "job_retention_hours": s.job_retention_hours,
             "api_workers": s.api.workers,
+            "download_transport": "x_accel" if s.api.x_accel else "stream",
             "finalized_count": cat.count_ready("finalized"),
             "finalized_ready": cat.is_finalized_ready(),
             "external_count": cat.count_ready("external"),
@@ -110,7 +113,12 @@ def _x_accel(
     headers = {"X-Accel-Redirect": f"/internal-files/{rel_under_data.lstrip('/')}"}
     if filename:
         mode = "inline" if inline else "attachment"
-        headers["Content-Disposition"] = f'{mode}; filename="{filename}"'
+        quoted = quote(filename, safe="")
+        headers["Content-Disposition"] = (
+            f"{mode}; filename*=utf-8''{quoted}"
+            if quoted != filename
+            else f'{mode}; filename="{filename}"'
+        )
     return Response(status_code=200, headers=headers)
 
 
@@ -120,15 +128,18 @@ def _serve_under_data(
     filename: str,
     *,
     inline: bool = False,
+    use_accel: bool | None = None,
 ) -> Response:
     """Prefer nginx X-Accel; fall back to FileResponse for direct API access."""
-    use_accel = os.environ.get("ASSET_HUB_X_ACCEL", "1") != "0"
+    if use_accel is None:
+        use_accel = os.environ.get("ASSET_HUB_X_ACCEL", "1") != "0"
     if use_accel:
         try:
             rel = path.resolve().relative_to(data_root.resolve()).as_posix()
-            return _x_accel(rel, filename=filename, inline=inline)
         except ValueError:
             pass
+        else:
+            return _x_accel(rel, filename=filename, inline=inline)
     return FileResponse(
         path,
         filename=filename,
@@ -431,6 +442,7 @@ def _download_asset(asset_id: str, *, inline: bool = False) -> Response:
         s.data_root,
         asset.file_name or path.name,
         inline=inline,
+        use_accel=s.api.x_accel,
     )
 
 
@@ -461,6 +473,7 @@ def _preview_asset(asset_id: str) -> Response:
         s.data_root,
         asset.file_name or path.name,
         inline=True,
+        use_accel=s.api.x_accel,
     )
 
 
@@ -669,7 +682,7 @@ def download_job(job_id: str) -> Response:
         with _download_cache_lock:
             _download_cache.pop(job_id, None)
         raise HTTPException(404, "结果文件不存在")
-    return _serve_under_data(path, s.data_root, name)
+    return _serve_under_data(path, s.data_root, name, use_accel=s.api.x_accel)
 
 
 # optional static fallback when hitting API port directly (nginx normally serves web/)

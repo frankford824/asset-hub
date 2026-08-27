@@ -43,6 +43,7 @@ provider: mock
 api:
   host: 127.0.0.1
   port: 18080
+  x_accel: false
 sync:
   kinds: [finalized]
   ignore_globs: ["Thumbs.db", "desktop.ini", "._*"]
@@ -727,6 +728,57 @@ def test_asset_single_and_batch_download(settings):
         assert archive.namelist() == [first.name, second.name]
         assert archive.read(first.name) == b"first-image"
         assert archive.read(second.name) == b"second-image"
+
+
+def test_job_pruning_removes_only_expired_terminal_jobs(settings):
+    store = JobStore(settings)
+    now = time.time()
+    old_done = store.create(filename="old.xlsx")
+    recent_done = store.create(filename="recent.xlsx")
+    old_running = store.create(filename="running.xlsx")
+    for job, status, finished_at in (
+        (old_done, "done", now - 48 * 3600),
+        (recent_done, "done", now - 3600),
+        (old_running, "running", now - 48 * 3600),
+    ):
+        directory = store.job_dir(job.id)
+        (directory / "result.zip").write_bytes(job.id.encode())
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET status=?, finished_at=? WHERE id=?",
+                (status, finished_at, job.id),
+            )
+
+    deleted, deleted_bytes = store.prune_finished(24, keep_recent=1, now=now)
+
+    assert deleted == 1
+    assert deleted_bytes == len(old_done.id)
+    assert store.get(old_done.id) is None
+    assert not (settings.jobs_dir / old_done.id).exists()
+    assert store.get(recent_done.id) is not None
+    assert (settings.jobs_dir / recent_done.id).is_dir()
+    assert store.get(old_running.id) is not None
+    assert (settings.jobs_dir / old_running.id).is_dir()
+
+
+def test_job_download_uses_configured_x_accel(settings):
+    store = JobStore(settings)
+    job = store.create(filename="常规海报.xlsx")
+    archive = store.job_dir(job.id) / "result.zip"
+    archive.write_bytes(b"zip-bytes")
+    store.update(job.id, status="done", archive_path=str(archive), finished=True)
+    settings.api.x_accel = True
+
+    from asset_hub.api.main import app
+
+    response = TestClient(app).get(f"/api/v1/jobs/{job.id}/download")
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["x-accel-redirect"] == f"/internal-files/jobs/{job.id}/result.zip"
+    assert response.headers["content-disposition"].startswith(
+        "attachment; filename*=utf-8''%E5%B8%B8%E8%A7%84%E6%B5%B7%E6%8A%A5_pack.zip"
+    )
 
 
 def test_create_job_allows_library_fallback_before_sync_complete(settings):

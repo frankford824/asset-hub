@@ -9,6 +9,10 @@ User=ybyc
 Group=asset-hub
 Environment=ASSET_HUB_CONFIG=/etc/asset-hub/config.yaml
 Environment=ASSET_HUB_ROOT=/opt/asset-hub
+# Production downloads must use the nginx internal file location.  Keeping
+# this explicit also prevents a stale manager environment from silently
+# falling back to proxying multi-hundred-megabyte responses through Uvicorn.
+Environment=ASSET_HUB_X_ACCEL=1
 WorkingDirectory=/opt/asset-hub
 ExecStart=/opt/asset-hub/.venv/bin/asset-hub-api
 Restart=on-failure

@@ -337,7 +337,21 @@ def _worker_loop(worker_id: int, stop_event=None) -> None:
         os.getpid(),
         settings.jobs_dir,
     )
+    next_prune = 0.0
     while stop_event is None or not stop_event.is_set():
+        if worker_id == 1 and time.monotonic() >= next_prune:
+            try:
+                deleted, deleted_bytes = store.prune_finished(settings.job_retention_hours)
+                if deleted:
+                    log.info(
+                        "pruned expired jobs=%s bytes=%s retention_hours=%s",
+                        deleted,
+                        deleted_bytes,
+                        settings.job_retention_hours,
+                    )
+            except Exception:
+                log.exception("expired job pruning failed")
+            next_prune = time.monotonic() + 3600
         job = store.claim_next()
         if not job:
             if stop_event is not None:

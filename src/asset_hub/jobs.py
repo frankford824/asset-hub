@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -248,6 +250,56 @@ class JobStore:
         d = self.settings.jobs_dir / job_id
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def prune_finished(
+        self,
+        retention_hours: int,
+        *,
+        keep_recent: int = 20,
+        now: float | None = None,
+    ) -> tuple[int, int]:
+        """Remove expired terminal job files and rows, preserving recent jobs."""
+        cutoff = (time.time() if now is None else now) - retention_hours * 3600
+        with self.connect() as conn:
+            terminal = conn.execute(
+                """
+                SELECT id, COALESCE(finished_at, created_at) AS terminal_at
+                  FROM jobs
+                 WHERE status IN ('done', 'failed')
+                 ORDER BY created_at DESC
+                """
+            ).fetchall()
+        candidates = [
+            str(row["id"])
+            for row in terminal[max(0, keep_recent) :]
+            if float(row["terminal_at"] or 0) < cutoff
+        ]
+
+        jobs_root = self.settings.jobs_dir.resolve()
+        deleted_ids: list[str] = []
+        deleted_bytes = 0
+        for job_id in candidates:
+            if not re.fullmatch(r"[0-9a-f]{32}", job_id):
+                continue
+            job_dir = self.settings.jobs_dir / job_id
+            if job_dir.is_symlink():
+                continue
+            resolved = job_dir.resolve()
+            if resolved.parent != jobs_root:
+                continue
+            if resolved.is_dir():
+                deleted_bytes += sum(
+                    entry.stat().st_size
+                    for entry in resolved.rglob("*")
+                    if entry.is_file() and not entry.is_symlink()
+                )
+                shutil.rmtree(resolved)
+            deleted_ids.append(job_id)
+
+        if deleted_ids:
+            with self.connect() as conn:
+                conn.executemany("DELETE FROM jobs WHERE id=?", ((job_id,) for job_id in deleted_ids))
+        return len(deleted_ids), deleted_bytes
 
     @staticmethod
     def _to_job(row: sqlite3.Row) -> Job:
