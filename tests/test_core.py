@@ -781,6 +781,39 @@ def test_job_download_uses_configured_x_accel(settings):
     )
 
 
+def test_finalized_download_x_accel_encodes_unicode_internal_path(settings):
+    source = settings.finalized_dir / "53871" / "CGK002122——露岩【1.6x1m】.jpg"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"finalized-image")
+    Catalog(settings).upsert_asset(
+        AssetRow(
+            asset_id="finalized:53871",
+            kind="finalized",
+            file_name=source.name,
+            file_size=source.stat().st_size,
+            local_path=str(source),
+            status="ready",
+        )
+    )
+    settings.api.x_accel = True
+
+    from asset_hub.api.main import app
+
+    response = TestClient(app).get(
+        "/api/v1/asset/download", params={"id": "finalized:53871"}
+    )
+
+    assert response.status_code == 200
+    assert response.content == b""
+    assert response.headers["x-accel-redirect"] == (
+        "/internal-files/finalized/53871/"
+        "CGK002122%E2%80%94%E2%80%94%E9%9C%B2%E5%B2%A9%E3%80%901.6x1m%E3%80%91.jpg"
+    )
+    assert response.headers["content-disposition"].startswith(
+        "attachment; filename*=utf-8''CGK002122%E2%80%94%E2%80%94"
+    )
+
+
 def test_create_job_allows_library_fallback_before_sync_complete(settings):
     cat = Catalog(settings)
     local = settings.library_root / "HQT40001.jpg"

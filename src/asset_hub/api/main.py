@@ -110,7 +110,8 @@ def _x_accel(
     *,
     inline: bool = False,
 ) -> Response:
-    headers = {"X-Accel-Redirect": f"/internal-files/{rel_under_data.lstrip('/')}"}
+    internal_uri = quote(rel_under_data.lstrip("/"), safe="/")
+    headers = {"X-Accel-Redirect": f"/internal-files/{internal_uri}"}
     if filename:
         mode = "inline" if inline else "attachment"
         quoted = quote(filename, safe="")
