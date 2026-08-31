@@ -8,6 +8,7 @@ const state = {
   history: [""], historyIndex: 0, treeCache: new Map(), expanded: new Set([""]),
   batchDownloadUrl: "", batchDownloadSignature: "",
   previewId: null, searchTimer: null, toastTimer: null,
+  libraryRequestId: 0,
 };
 
 function escapeHtml(value) {
@@ -28,6 +29,15 @@ function fmtTime(value) {
 function isImage(name) { return /\.(jpe?g|png|gif|webp|bmp|tiff?)$/i.test(name || ""); }
 function previewUrl(id) { return `/api/v1/asset/preview?id=${encodeURIComponent(id)}`; }
 function downloadUrl(id) { return `/api/v1/asset/download?id=${encodeURIComponent(id)}`; }
+function normalizeSearchInput(value) {
+  const text = String(value || "").normalize("NFKC").trim();
+  const matches = [...text.matchAll(/[A-Za-z][A-Za-z0-9._-]*\d+/g)];
+  if (matches.length === 1) {
+    const match = matches[0], remainder = text.slice(0, match.index) + text.slice(match.index + match[0].length);
+    if (![...remainder].some((char) => /[\p{L}\p{N}]/u.test(char))) return match[0].toUpperCase().replace(/[-_.]+$/, "");
+  }
+  return text;
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, options);
@@ -164,8 +174,10 @@ function renderTree() {
 async function loadLibrary(path, { append = false, pushHistory = false } = {}) {
   const clean = path.replace(/^\/+|\/+$/g, "");
   const offset = append ? state.files.length : 0; state.path = clean;
+  const requestId = ++state.libraryRequestId, requestQuery = state.query;
   if (!append) { state.offset = 0; state.selected.clear(); state.focusedId = null; state.batchDownloadUrl = ""; }
   const data = await fetchTree(clean, 200, offset);
+  if (requestId !== state.libraryRequestId || requestQuery !== state.query || clean !== state.path) return;
   state.directories = data.directories || []; state.files = append ? [...state.files, ...(data.files || [])] : (data.files || []);
   state.hasMore = Boolean(data.has_more); if (!state.query) state.treeCache.set(clean, state.directories);
   await ensureTreePath(clean); if (pushHistory && state.history[state.historyIndex] !== clean) { state.history = state.history.slice(0, state.historyIndex + 1); state.history.push(clean); state.historyIndex += 1; }
@@ -266,7 +278,7 @@ $("#excel").addEventListener("change", (event) => { $("#excel-label").textConten
 const excelDrop = $("#excel-drop"); ["dragenter", "dragover"].forEach((name) => excelDrop.addEventListener(name, (event) => { event.preventDefault(); excelDrop.classList.add("dragging"); })); ["dragleave", "drop"].forEach((name) => excelDrop.addEventListener(name, () => excelDrop.classList.remove("dragging")));
 $("#nav-home").addEventListener("click", () => navigate("")); $("#nav-up").addEventListener("click", () => navigate(state.path.split("/").slice(0,-1).join("/"))); $("#nav-back").addEventListener("click", () => { if (state.historyIndex <= 0) return; state.historyIndex -= 1; loadLibrary(state.history[state.historyIndex]).catch(showError); });
 const librarySearch = $("#library-search");
-function submitLibrarySearch() { clearTimeout(state.searchTimer); state.query = librarySearch.value.trim(); loadLibrary(state.path).catch(showError); }
+function submitLibrarySearch() { clearTimeout(state.searchTimer); state.query = normalizeSearchInput(librarySearch.value); librarySearch.value = state.query; loadLibrary(state.path).catch(showError); }
 librarySearch.addEventListener("input", () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(submitLibrarySearch, 250); });
 librarySearch.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); submitLibrarySearch(); } });
 librarySearch.addEventListener("search", submitLibrarySearch);

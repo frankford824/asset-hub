@@ -85,6 +85,23 @@ def test_catalog_search_sku(settings):
     assert hits[0][0].asset_id == "a1"
 
 
+def test_catalog_search_tolerates_punctuation_and_fullwidth_exact_sku(settings):
+    cat = Catalog(settings)
+    asset = AssetRow(
+        asset_id="external:HSC38660",
+        kind="external",
+        file_name="HSC38660——五财神.jpg",
+        sku_code="HSC38660",
+        status="ready",
+    )
+    cat.upsert_asset(asset)
+
+    for query in ("。 HSC38660", "•HSC38660", "【HSC38660】", "ＨＳＣ３８６６０"):
+        hits, total = cat.search(query)
+        assert total == 1
+        assert [row.asset_id for row in hits] == [asset.asset_id]
+
+
 def test_catalog_search_normalizes_and_reads_legacy_trailing_punctuation(settings):
     cat = Catalog(settings)
     asset = AssetRow(

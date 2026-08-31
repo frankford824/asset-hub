@@ -92,6 +92,14 @@ def test_pack_submit_explains_duplicate_output_behavior():
     assert "个完全重复行已合并" not in app
 
 
+def test_library_search_normalizes_sku_and_ignores_stale_responses():
+    app = (ROOT / "web/dist/app.js").read_text()
+
+    assert "normalizeSearchInput(librarySearch.value)" in app
+    assert "libraryRequestId" in app
+    assert "requestId !== state.libraryRequestId" in app
+
+
 def test_deploy_preserves_nginx_traversal_permission():
     install = (ROOT / "deploy/install.sh").read_text()
     deploy = (ROOT / "scripts/deploy_to_ybyc.sh").read_text()

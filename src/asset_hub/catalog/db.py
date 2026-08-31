@@ -14,6 +14,7 @@ from asset_hub.config import Settings, ensure_data_dirs, get_settings
 
 SKU_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_.]{2,}")
 SKU_QUERY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]*\d+$")
+EMBEDDED_SKU_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]*\d+")
 
 
 SCHEMA = """
@@ -150,6 +151,19 @@ CREATE INDEX IF NOT EXISTS idx_download_selections_created ON download_selection
 
 def normalize_sku_token(value: str) -> str:
     return value.strip().upper().rstrip("-_.")
+
+
+def normalize_search_query(value: str) -> str:
+    """Normalize full-width text and unwrap punctuation around one exact SKU."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    matches = list(EMBEDDED_SKU_RE.finditer(text))
+    if len(matches) == 1:
+        match = matches[0]
+        token = normalize_sku_token(match.group(0))
+        remainder = text[: match.start()] + text[match.end() :]
+        if SKU_QUERY_RE.fullmatch(token) and not any(ch.isalnum() for ch in remainder):
+            return token
+    return text
 
 
 def normalize_file_name(value: str) -> str:
@@ -1441,7 +1455,7 @@ class Catalog:
     ) -> tuple[list[AssetRow], int]:
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
-        q = query.strip()
+        q = normalize_search_query(query)
         priority_order = """
           CASE a.kind
             WHEN 'finalized' THEN 0
