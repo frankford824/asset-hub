@@ -37,7 +37,7 @@ DEFAULT_RULES = (
     PackRule("rule-sku", "validate-sku", "校验 SKU 格式", "SKU 必须为英文字母开头并以数字结尾；不合规则记入缺失清单。", "validate_sku", sort_order=40),
     PackRule("rule-keyword", "keyword-filter", "关键词二次筛选", "Excel 提供关键词时，仅保留路径或文件信息中包含关键词的候选。", "keyword_filter", sort_order=50),
     PackRule("rule-quantity", "repeat-quantity", "按数量复制素材", "读取 Excel 数量列，按订购数量写入素材副本。", "repeat_quantity", sort_order=60),
-    PackRule("rule-rename", "preserve-product-name", "保留商品名称与尺寸", "保留完整商品文件名；多图商品按描述目录归组；完全重复行合并，同编码但业务字段不同仍独立输出。", "rename_sku_sequence", sort_order=70),
+    PackRule("rule-rename", "preserve-product-name", "保留商品名称与尺寸", "保留完整商品文件名；多图商品按描述目录归组，重复业务行按出现次数分别输出。", "rename_sku_sequence", sort_order=70),
     PackRule("rule-address", "write-address", "生成地址文件", "存在地址列时，在订单目录写入地址.txt。", "write_address", sort_order=80),
     PackRule("rule-sensitive", "mark-sensitive", "敏感订单标记", "地址包含 * 时，在订单目录名追加【敏感】。", "mark_sensitive", sort_order=90),
     PackRule("rule-missing", "missing-report", "生成缺失清单", "将格式错误、库内缺失和读取异常写入未找到编码.txt。", "missing_report", sort_order=100),
@@ -61,6 +61,7 @@ class PackRuleStore:
         self._seed_once()
         self._migrate_preserved_names_once()
         self._migrate_exact_duplicate_policy_once()
+        self._migrate_duplicate_output_policy_once()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -148,6 +149,29 @@ class PackRuleStore:
                 """
                 UPDATE pack_rules
                    SET description='保留完整商品文件名；多图商品按描述目录归组；完全重复行合并，同编码但业务字段不同仍独立输出。',
+                       updated_at=?
+                 WHERE id='rule-rename'
+                   AND handler='rename_sku_sequence'
+                """,
+                (now,),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO app_meta(key,value) VALUES(?,?)",
+                (marker, str(now)),
+            )
+
+    def _migrate_duplicate_output_policy_once(self) -> None:
+        marker = "pack_rules_duplicate_output_policy_v4"
+        with self.connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM app_meta WHERE key=?", (marker,)
+            ).fetchone():
+                return
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE pack_rules
+                   SET description='保留完整商品文件名；多图商品按描述目录归组，重复业务行按出现次数分别输出。',
                        updated_at=?
                  WHERE id='rule-rename'
                    AND handler='rename_sku_sequence'

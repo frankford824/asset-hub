@@ -86,7 +86,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         phase_started = time.perf_counter()
         input_rows = read_excel_rows(excel_path)
         unique_rows, duplicate_rows = deduplicate_rows(input_rows)
-        rows = unique_rows
+        rows = input_rows
         timings["parse_s"] = round(time.perf_counter() - phase_started, 4)
         phase_started = time.perf_counter()
         matched, missing = match_assets_for_rows(
@@ -104,8 +104,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             block["selection_policy"] == "library_fallback" for block in matched
         )
         summary = (
-            f"收到 {len(input_rows)} 行 · 去重后 {len(unique_rows)} 行 · "
-            f"完全重复 {len(duplicate_rows)} 行已合并 · "
+            f"收到 {len(input_rows)} 行 · 唯一 {len(unique_rows)} 个编码 · "
+            f"重复 {len(duplicate_rows)} 行按次输出 · "
             f"匹配 {len(matched)} 行 · 优选 {preferred_rows} 行 · "
             f"兜底 {fallback_rows} 行 · 缺失 {len(missing)} 行"
         )
@@ -132,8 +132,8 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
         selection_lines = [
             "统一素材库选择说明",
             f"输入编码行：{len(input_rows)}",
-            f"去重后业务行：{len(unique_rows)}",
-            f"完全重复行：{len(duplicate_rows)}（已合并，不重复输出）",
+            f"唯一编码：{len(unique_rows)}",
+            f"重复行：{len(duplicate_rows)}（不合并，按出现次数分别输出）",
             "本任务采用的规则：" + "、".join(
                 str(rule.get("name"))
                 for rule in ((job.meta or {}).get("rules") or [])
@@ -145,7 +145,7 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
             row = duplicate["row"]
             selection_lines.append(
                 f"第 {row.row_index} 行 · {row.sku_code or row.sku_name} · "
-                f"与第 {duplicate['first_row_index']} 行业务内容完全重复，已合并"
+                f"与第 {duplicate['first_row_index']} 行编码重复，保留为独立商品单位"
             )
         if duplicate_rows:
             selection_lines.append("")
