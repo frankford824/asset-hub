@@ -602,6 +602,9 @@ def test_current_asset_selection_prefers_sku_scope_over_newer_task_scope(setting
     selected = catalog.order_current_assets(assets)
 
     assert [asset.asset_id for asset in selected] == ["finalized:59270"]
+    hits, total = catalog.search("CGK002634")
+    assert total == 1
+    assert [asset.asset_id for asset in hits] == ["finalized:59270"]
 
 
 def test_current_asset_selection_preserves_items_from_winning_set_revision(settings):

@@ -1510,11 +1510,22 @@ class Catalog:
                       WHEN 'library' THEN 2
                       WHEN 'archive' THEN 3
                       ELSE 4 END,
-                      a.updated_at DESC, a.asset_id ASC
-                    LIMIT ? OFFSET ?""",
-                    [*args, limit, offset],
+                      a.updated_at DESC, a.asset_id ASC""",
+                    args,
                 ).fetchall()
-                return [self._row_to_asset(r) for r in rows], total
+                assets = [self._row_to_asset(r) for r in rows]
+                current = [asset for asset in assets if asset.kind == "finalized"]
+                if current:
+                    current_ids = {
+                        asset.asset_id for asset in self.order_current_assets(current)
+                    }
+                    assets = [
+                        asset
+                        for asset in assets
+                        if asset.kind != "finalized" or asset.asset_id in current_ids
+                    ]
+                total = len(assets)
+                return assets[offset : offset + limit], total
 
             # A syntactically complete SKU that is absent from the exact token
             # index cannot be rescued by prefix FTS. Returning immediately keeps
