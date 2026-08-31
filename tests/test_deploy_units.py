@@ -85,6 +85,13 @@ def test_library_download_uses_native_links_for_single_and_batch():
     assert 'document.createElement("a")' not in app
 
 
+def test_pack_submit_explains_exact_duplicate_merging():
+    app = (ROOT / "web/dist/app.js").read_text()
+
+    assert "个完全重复行已合并" in app
+    assert "重复行按次数分别输出" not in app
+
+
 def test_deploy_preserves_nginx_traversal_permission():
     install = (ROOT / "deploy/install.sh").read_text()
     deploy = (ROOT / "scripts/deploy_to_ybyc.sh").read_text()

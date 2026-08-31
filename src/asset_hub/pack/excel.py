@@ -11,6 +11,7 @@ from asset_hub.catalog.db import Catalog
 
 
 SKU_REGEX = re.compile(r"^[A-Za-z]+[A-Za-z0-9._-]*\d+$")
+SOURCE_FILE_EXTS = {".psd", ".psb", ".ai", ".cdr", ".eps"}
 
 
 @dataclass
@@ -159,28 +160,33 @@ def match_assets_for_rows(
     handlers = rule_handlers or {"prefer_current", "library_fallback"}
     matched = []
     missing = []
+
+    def local_deliverables(hits):
+        deliverables = []
+        source_seen = False
+        for hit in hits:
+            if not hit.local_path:
+                continue
+            path = Path(hit.local_path)
+            if not path.is_file() or path.stat().st_size != hit.file_size:
+                continue
+            if path.suffix.lower() in SOURCE_FILE_EXTS:
+                source_seen = True
+                continue
+            deliverables.append(hit)
+        return deliverables, source_seen
+
     for row in rows:
         q = row.sku_code or row.sku_name
         if "validate_sku" in handlers and row.sku_code and not SKU_REGEX.match(row.sku_code):
             missing.append({"row": row, "query": q, "reason": "SKU 格式错误"})
             continue
         hits, _total = catalog.search(q, limit=limit_per_row) if q else ([], 0)
-        available = [
-            hit
-            for hit in hits
-            if hit.local_path
-            and Path(hit.local_path).is_file()
-            and Path(hit.local_path).stat().st_size == hit.file_size
-        ]
+        available, source_seen = local_deliverables(hits)
         if not available and row.sku_name and row.sku_name != q:
             hits, _total = catalog.search(row.sku_name, limit=limit_per_row)
-            available = [
-                hit
-                for hit in hits
-                if hit.local_path
-                and Path(hit.local_path).is_file()
-                and Path(hit.local_path).stat().st_size == hit.file_size
-            ]
+            available, alternate_source_seen = local_deliverables(hits)
+            source_seen = source_seen or alternate_source_seen
         unique_available = []
         seen_paths: set[str] = set()
         for hit in available:
@@ -222,7 +228,8 @@ def match_assets_for_rows(
             selected = available
             policy, label = "available", "统一库匹配"
         else:
-            missing.append({"row": row, "query": q, "reason": "库内缺失"})
+            reason = "仅存在源文件，未找到成品素材" if source_seen else "库内缺失"
+            missing.append({"row": row, "query": q, "reason": reason})
             continue
         matched.append(
             {

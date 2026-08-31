@@ -365,7 +365,7 @@ def test_search_does_not_hide_current_assets_with_same_generic_filename(settings
     assert hits[0].asset_id == "finalized:2"
 
 
-def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(settings):
+def test_pack_preserves_product_names_groups_multi_image_and_merges_exact_duplicates(settings):
     root = settings.library_root
     product_name = "HSC36004——蔡谦-常规水晶标-喜字酒杯款-直径45cm"
     product = root / "水晶标" / product_name
@@ -411,20 +411,97 @@ def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(se
 
     with zipfile.ZipFile(done.archive_path) as archive:
         names = archive.namelist()
-        assert f"pack/{product_name}_1/第一张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_1/第二张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_2/第一张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_2/第二张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}/第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}/第二张【25x35cm】.jpg" in names
         assert f"pack/{single_name}" in names
-        assert not any("HSC36004_1" in name or "HSC36004_2" in name for name in names)
+        assert sum("HSC36004" in name for name in names) == 2
         report = archive.read("pack/素材选择说明.txt").decode("utf-8")
         assert "输入编码行：3" in report
-        assert "唯一编码：2" in report
-        assert "与第 2 行编码重复，保留为独立商品单位" in report
+        assert "去重后业务行：2" in report
+        assert "与第 2 行业务内容完全重复，已合并" in report
     assert done.progress["input_rows"] == 3
     assert done.progress["unique_rows"] == 2
     assert done.progress["duplicate_rows"] == 1
-    assert done.progress["matched"] == 3
+    assert done.progress["matched"] == 2
+
+
+def test_exact_duplicates_merge_but_business_differences_remain():
+    rows = [
+        ExcelRow(row_index=2, sku_code="HQT10912", quantity=1),
+        ExcelRow(row_index=3, sku_code="HQT10912", quantity=1),
+        ExcelRow(row_index=4, sku_code="HQT10912", order_id="ORDER-2", quantity=1),
+        ExcelRow(row_index=5, sku_code="HQT10912", quantity=2),
+    ]
+
+    unique, duplicates = deduplicate_rows(rows)
+
+    assert [row.row_index for row in unique] == [2, 4, 5]
+    assert [(item["row"].row_index, item["first_row_index"]) for item in duplicates] == [
+        (3, 2)
+    ]
+
+
+def test_matching_prefers_delivery_image_and_excludes_source_file(settings):
+    catalog = Catalog(settings)
+    psd = settings.library_root / "HSC30468-source.psd"
+    jpg = settings.library_root / "HSC30468-delivery.jpg"
+    psd.write_bytes(b"psd-source")
+    jpg.write_bytes(b"jpg-delivery")
+    catalog.upsert_assets(
+        [
+            AssetRow(
+                asset_id="external:source",
+                kind="external",
+                file_name=psd.name,
+                sku_code="HSC30468",
+                file_size=psd.stat().st_size,
+                local_path=str(psd),
+                status="ready",
+                updated_at=200,
+            ),
+            AssetRow(
+                asset_id="external:delivery",
+                kind="external",
+                file_name=jpg.name,
+                sku_code="HSC30468",
+                file_size=jpg.stat().st_size,
+                local_path=str(jpg),
+                status="ready",
+                updated_at=100,
+            ),
+        ]
+    )
+
+    matched, missing = match_assets_for_rows(
+        catalog, [ExcelRow(row_index=2, sku_code="HSC30468")]
+    )
+
+    assert not missing
+    assert [asset.asset_id for asset in matched[0]["assets"]] == ["external:delivery"]
+
+
+def test_matching_reports_source_only_as_missing_delivery(settings):
+    catalog = Catalog(settings)
+    psd = settings.library_root / "HSC30469-source.psd"
+    psd.write_bytes(b"psd-source")
+    catalog.upsert_asset(
+        AssetRow(
+            asset_id="external:source-only",
+            kind="external",
+            file_name=psd.name,
+            sku_code="HSC30469",
+            file_size=psd.stat().st_size,
+            local_path=str(psd),
+            status="ready",
+        )
+    )
+
+    matched, missing = match_assets_for_rows(
+        catalog, [ExcelRow(row_index=2, sku_code="HSC30469")]
+    )
+
+    assert not matched
+    assert missing[0]["reason"] == "仅存在源文件，未找到成品素材"
 
 
 def test_pack_keeps_single_finalized_asset_as_a_file(settings):
@@ -474,7 +551,7 @@ def test_pack_keeps_single_finalized_asset_as_a_file(settings):
     assert images == [f"pack/{source.name}"]
 
 
-def test_pack_chooses_one_best_file_for_repeated_sku_outside_product_directory(settings):
+def test_pack_chooses_one_best_file_and_merges_exact_duplicate_sku_rows(settings):
     catalog = Catalog(settings)
     parent = settings.library_root / "冯新妮皮普和波西KT板"
     parent.mkdir(parents=True)
@@ -530,10 +607,7 @@ def test_pack_chooses_one_best_file_for_repeated_sku_outside_product_directory(s
 
     with zipfile.ZipFile(done.archive_path) as archive:
         files = [name for name in archive.namelist() if name.lower().endswith(".jpg")]
-    assert files == [
-        "pack/HQT03449—波西和皮普—高80cm(外发)_1.jpg",
-        "pack/HQT03449—波西和皮普—高80cm(外发)_2.jpg",
-    ]
+    assert files == ["pack/HQT03449—波西和皮普—高80cm(外发).jpg"]
 
 
 def test_current_catalog_can_initialize_while_writer_holds_lock(settings):
@@ -1102,6 +1176,8 @@ def test_pack_rule_crud_and_job_snapshot(settings):
         "repeat_quantity",
         "missing_report",
     }
+    rename = next(rule for rule in defaults if rule.handler == "rename_sku_sequence")
+    assert "完全重复行合并" in rename.description
     custom = rules.create(
         name="人工复核说明",
         description="结果交付前人工复核",
