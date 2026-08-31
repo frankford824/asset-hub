@@ -553,6 +553,100 @@ def test_pack_keeps_single_finalized_asset_as_a_file(settings):
     assert images == [f"pack/{source.name}"]
 
 
+def test_current_asset_selection_prefers_sku_scope_over_newer_task_scope(settings):
+    catalog = Catalog(settings)
+    correct = settings.finalized_dir / "59270" / "CGK002634-correct.jpg"
+    wrong = settings.finalized_dir / "59294" / "CGK002634-copy.jpg"
+    correct.parent.mkdir(parents=True)
+    wrong.parent.mkdir(parents=True)
+    correct.write_bytes(b"correct")
+    wrong.write_bytes(b"wrong")
+    assets = [
+        AssetRow(
+            asset_id="finalized:59270",
+            task_asset_id=59270,
+            kind="finalized",
+            file_name=correct.name,
+            file_size=correct.stat().st_size,
+            sku_code="CGK002634",
+            local_path=str(correct),
+            status="ready",
+        ),
+        AssetRow(
+            asset_id="finalized:59294",
+            task_asset_id=59294,
+            kind="finalized",
+            file_name=wrong.name,
+            file_size=wrong.stat().st_size,
+            sku_code="CGK002634",
+            local_path=str(wrong),
+            status="ready",
+        ),
+    ]
+    catalog.upsert_assets(assets)
+    with catalog.connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO finalized_items(
+              revision_item_id,task_asset_id,group_id,revision_id,revision_mode,
+              finalized_at,task_id,task_no,scope_kind,sku_code,product_name,
+              sort_order,item_name,manifest_id,deleted
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+            """,
+            [
+                (11121, 59270, 8622, 9068, "single", 100, 5050, "SKU", "sku", "CGK002634", "", 0, "", "m1"),
+                (11123, 59294, 8642, 9075, "single", 200, 5068, "TASK", "task", "CGK002634", "", 0, "", "m2"),
+            ],
+        )
+
+    selected = catalog.order_current_assets(assets)
+
+    assert [asset.asset_id for asset in selected] == ["finalized:59270"]
+
+
+def test_current_asset_selection_preserves_items_from_winning_set_revision(settings):
+    catalog = Catalog(settings)
+    assets = []
+    for task_asset_id, name in ((70001, "第一张.jpg"), (70002, "第二张.jpg"), (70003, "旧任务.jpg")):
+        path = settings.finalized_dir / str(task_asset_id) / name
+        path.parent.mkdir(parents=True)
+        path.write_bytes(name.encode())
+        asset = AssetRow(
+            asset_id=f"finalized:{task_asset_id}",
+            task_asset_id=task_asset_id,
+            kind="finalized",
+            file_name=name,
+            file_size=path.stat().st_size,
+            sku_code="HSC70000",
+            local_path=str(path),
+            status="ready",
+        )
+        catalog.upsert_asset(asset)
+        assets.append(asset)
+    with catalog.connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO finalized_items(
+              revision_item_id,task_asset_id,group_id,revision_id,revision_mode,
+              finalized_at,task_id,task_no,scope_kind,sku_code,product_name,
+              sort_order,item_name,manifest_id,deleted
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)
+            """,
+            [
+                (12001, 70001, 9001, 9101, "set", 200, 6001, "SET", "sku", "HSC70000", "", 0, "", "m1"),
+                (12002, 70002, 9001, 9101, "set", 200, 6001, "SET", "sku", "HSC70000", "", 1, "", "m1"),
+                (12003, 70003, 9002, 9102, "single", 300, 6002, "TASK", "task", "HSC70000", "", 0, "", "m2"),
+            ],
+        )
+
+    selected = catalog.order_current_assets(assets)
+
+    assert [asset.asset_id for asset in selected] == [
+        "finalized:70001",
+        "finalized:70002",
+    ]
+
+
 def test_pack_chooses_one_best_file_for_repeated_sku_outside_product_directory(settings):
     catalog = Catalog(settings)
     parent = settings.library_root / "冯新妮皮普和波西KT板"

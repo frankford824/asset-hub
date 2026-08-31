@@ -1624,7 +1624,7 @@ class Catalog:
             return str(row["asset_ids_json"])
 
     def order_current_assets(self, assets: Sequence[AssetRow]) -> list[AssetRow]:
-        """Order current-version candidates by finalized metadata and remove duplicates."""
+        """Select one authoritative revision, preserving its intentional set items."""
         by_id = {asset.asset_id: asset for asset in assets}
         if not by_id:
             return []
@@ -1632,25 +1632,39 @@ class Catalog:
         with self.connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT a.asset_id
+                SELECT a.asset_id, i.group_id, i.revision_id, i.revision_mode,
+                       i.finalized_at, i.scope_kind, i.sort_order
                 FROM assets a
-                LEFT JOIN (
-                  SELECT task_asset_id,
-                         MAX(finalized_at) AS finalized_at,
-                         MIN(sort_order) AS sort_order
-                  FROM finalized_items
-                  WHERE deleted=0
-                  GROUP BY task_asset_id
-                ) i ON i.task_asset_id=a.task_asset_id
+                LEFT JOIN finalized_items i
+                  ON i.task_asset_id=a.task_asset_id AND i.deleted=0
                 WHERE a.asset_id IN ({placeholders})
-                ORDER BY COALESCE(i.finalized_at, 0) DESC,
+                ORDER BY CASE COALESCE(i.scope_kind, '')
+                           WHEN 'sku' THEN 0
+                           WHEN 'task' THEN 1
+                           ELSE 2
+                         END,
+                         COALESCE(i.finalized_at, 0) DESC,
+                         COALESCE(i.revision_id, 0) DESC,
+                         COALESCE(i.group_id, 0) DESC,
                          COALESCE(i.sort_order, 2147483647) ASC,
                          a.updated_at DESC,
                          a.asset_id ASC
                 """,
                 list(by_id),
             ).fetchall()
-        return [by_id[row["asset_id"]] for row in rows]
+        metadata_rows = [row for row in rows if row["revision_id"] is not None]
+        if not metadata_rows:
+            return [by_id[row["asset_id"]] for row in rows]
+        winner = metadata_rows[0]
+        selected = [
+            row
+            for row in metadata_rows
+            if row["group_id"] == winner["group_id"]
+            and row["revision_id"] == winner["revision_id"]
+        ]
+        if str(winner["revision_mode"] or "").casefold() == "single":
+            selected = selected[:1]
+        return [by_id[row["asset_id"]] for row in selected]
 
     def set_sync_state(
         self,
