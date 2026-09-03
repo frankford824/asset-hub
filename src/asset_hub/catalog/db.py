@@ -548,6 +548,34 @@ class Catalog:
             ).fetchone()
             return self._row_to_asset(row) if row else None
 
+    def resolve_asset_sku_codes(self, assets: Sequence[AssetRow]) -> dict[str, str]:
+        """Resolve one unambiguous export SKU per asset without guessing."""
+        resolved: dict[str, str] = {}
+        unresolved = []
+        for asset in assets:
+            explicit = normalize_sku_token(asset.sku_code)
+            if SKU_QUERY_RE.fullmatch(explicit):
+                resolved[asset.asset_id] = explicit
+            else:
+                unresolved.append(asset.asset_id)
+        if not unresolved:
+            return resolved
+        placeholders = ",".join("?" for _ in unresolved)
+        candidates: dict[str, set[str]] = {asset_id: set() for asset_id in unresolved}
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT asset_id,token FROM sku_tokens WHERE asset_id IN ({placeholders})",
+                unresolved,
+            ).fetchall()
+        for row in rows:
+            token = normalize_sku_token(row["token"])
+            if SKU_QUERY_RE.fullmatch(token):
+                candidates[str(row["asset_id"])].add(token)
+        for asset_id, values in candidates.items():
+            if len(values) == 1:
+                resolved[asset_id] = next(iter(values))
+        return resolved
+
     def library_fingerprints(self) -> dict[str, dict[str, Any]]:
         """Return the minimal state needed to skip unchanged filesystem rows."""
         with self.connect() as conn:

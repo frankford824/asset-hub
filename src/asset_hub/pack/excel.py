@@ -11,6 +11,7 @@ from asset_hub.catalog.db import Catalog
 
 
 SKU_REGEX = re.compile(r"^[A-Za-z]+[A-Za-z0-9._-]*\d+$")
+EMBEDDED_SKU_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]*\d+")
 SOURCE_FILE_EXTS = {".psd", ".psb", ".ai", ".cdr", ".eps"}
 
 
@@ -23,6 +24,16 @@ class ExcelRow:
     quantity: int = 1
     address: str = ""
     keyword: str = ""
+
+
+def ensure_sku_in_filename(filename: str, sku_code: str) -> str:
+    """Prefix an unambiguous SKU without duplicating an existing code."""
+    name = Path(filename or "").name
+    sku = str(sku_code or "").strip().upper()
+    if not name or not SKU_REGEX.fullmatch(sku):
+        return name
+    tokens = {match.group(0).upper().rstrip("-_.") for match in EMBEDDED_SKU_RE.finditer(name)}
+    return name if sku in tokens else f"{sku}——{name}"
 
 
 def _cell_str(value) -> str:

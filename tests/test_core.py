@@ -428,10 +428,10 @@ def test_pack_preserves_product_names_groups_multi_image_and_keeps_duplicates(se
 
     with zipfile.ZipFile(done.archive_path) as archive:
         names = archive.namelist()
-        assert f"pack/{product_name}_1/第一张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_1/第二张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_2/第一张【25x35cm】.jpg" in names
-        assert f"pack/{product_name}_2/第二张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_1/HSC36004——第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_1/HSC36004——第二张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_2/HSC36004——第一张【25x35cm】.jpg" in names
+        assert f"pack/{product_name}_2/HSC36004——第二张【25x35cm】.jpg" in names
         assert f"pack/{single_name}" in names
         assert not any("HSC36004_1" in name or "HSC36004_2" in name for name in names)
         report = archive.read("pack/素材选择说明.txt").decode("utf-8")
@@ -567,7 +567,7 @@ def test_pack_keeps_single_finalized_asset_as_a_file(settings):
 
     with zipfile.ZipFile(done.archive_path) as archive:
         images = [name for name in archive.namelist() if name.lower().endswith(".jpg")]
-    assert images == [f"pack/{source.name}"]
+    assert images == [f"pack/CGK000672——{source.name}"]
 
 
 def test_current_asset_selection_prefers_sku_scope_over_newer_task_scope(settings):
@@ -921,6 +921,57 @@ def test_asset_single_and_batch_download(settings):
         assert archive.namelist() == [first.name, second.name]
         assert archive.read(first.name) == b"first-image"
         assert archive.read(second.name) == b"second-image"
+
+
+def test_downloads_prefix_unambiguous_sku_for_generic_filename(settings):
+    source = settings.library_root / "露素常规海报.jpg"
+    source.write_bytes(b"generic-final")
+    asset = AssetRow(
+        asset_id="finalized:10398",
+        task_asset_id=10398,
+        kind="finalized",
+        file_name=source.name,
+        file_size=source.stat().st_size,
+        sku_code="CGP000123",
+        local_path=str(source),
+        status="ready",
+    )
+    catalog = Catalog(settings)
+    catalog.upsert_asset(asset)
+
+    from asset_hub.api.main import app
+
+    client = TestClient(app)
+    single = client.get("/api/v1/asset/download", params={"id": asset.asset_id})
+    assert single.status_code == 200
+    assert "CGP000123%E2%80%94%E2%80%94" in single.headers["content-disposition"]
+
+    ticket = client.post("/api/v1/assets/download-ticket", json={"ids": [asset.asset_id]})
+    batch = client.get(ticket.json()["download_url"])
+    with zipfile.ZipFile(BytesIO(batch.content)) as archive:
+        assert archive.namelist() == ["CGP000123——露素常规海报.jpg"]
+        assert archive.read("CGP000123——露素常规海报.jpg") == b"generic-final"
+
+
+def test_downloads_resolve_sku_from_generic_external_product_path(settings):
+    source = settings.library_root / "HSC16830——中秋套装" / "两只兔子.jpg"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"rabbit")
+    asset = AssetRow(
+        asset_id="external:generic-child",
+        kind="external",
+        file_name=source.name,
+        file_size=source.stat().st_size,
+        local_path=str(source),
+        virtual_path="HSC16830——中秋套装/两只兔子.jpg",
+        status="ready",
+    )
+    catalog = Catalog(settings)
+    catalog.upsert_asset(asset)
+
+    assert catalog.resolve_asset_sku_codes([asset]) == {
+        asset.asset_id: "HSC16830"
+    }
 
 
 def test_job_pruning_removes_only_expired_terminal_jobs(settings):

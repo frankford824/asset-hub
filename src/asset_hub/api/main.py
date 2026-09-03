@@ -21,7 +21,7 @@ from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path
 from asset_hub.config import ensure_data_dirs, get_settings, library_mount_available
 from asset_hub.jobs import JobStore
 from asset_hub.pack.rules import PackRuleStore, SUPPORTED_HANDLERS
-from asset_hub.pack.excel import deduplicate_rows, read_excel_rows
+from asset_hub.pack.excel import deduplicate_rows, ensure_sku_in_filename, read_excel_rows
 from asset_hub.pack.ziputil import zip_paths
 
 
@@ -196,20 +196,27 @@ def _download_archive(asset_ids: list[str], background_tasks: BackgroundTasks) -
     settings = get_settings()
     catalog = Catalog(settings)
     ids = list(dict.fromkeys(asset_ids))[:200]
-    pairs: list[tuple[Path, str]] = []
-    used_names: dict[str, int] = {}
+    selected: list[tuple[AssetRow, Path]] = []
     for asset_id in ids:
         asset = catalog.get_asset(asset_id)
         if not asset or asset.deleted or asset.status != "ready" or not asset.local_path:
             continue
         source = Path(asset.local_path)
-        if not source.is_file():
-            continue
-        count = used_names.get(asset.file_name, 0) + 1
-        used_names[asset.file_name] = count
-        arcname = asset.file_name
+        if source.is_file():
+            selected.append((asset, source))
+    sku_codes = catalog.resolve_asset_sku_codes([asset for asset, _source in selected])
+    pairs: list[tuple[Path, str]] = []
+    used_names: dict[str, int] = {}
+    for asset, source in selected:
+        export_name = ensure_sku_in_filename(
+            asset.file_name, sku_codes.get(asset.asset_id, "")
+        )
+        count = used_names.get(export_name, 0) + 1
+        used_names[export_name] = count
+        arcname = export_name
         if count > 1:
-            arcname = f"{source.stem}_{count}{source.suffix}"
+            export_path = Path(export_name)
+            arcname = f"{export_path.stem}_{count}{export_path.suffix}"
         pairs.append((source, arcname))
     if not pairs:
         raise HTTPException(404, "所选素材均不可用")
@@ -437,11 +444,15 @@ def _download_asset(asset_id: str, *, inline: bool = False) -> Response:
     path = Path(asset.local_path)
     if not path.is_file():
         raise HTTPException(404, "本地文件缺失")
+    filename = asset.file_name or path.name
+    if not inline:
+        sku_code = cat.resolve_asset_sku_codes([asset]).get(asset.asset_id, "")
+        filename = ensure_sku_in_filename(filename, sku_code)
     # 默认下载为 attachment；显式 inline 或预览场景走 inline
     return _serve_under_data(
         path,
         s.data_root,
-        asset.file_name or path.name,
+        filename,
         inline=inline,
         use_accel=s.api.x_accel,
     )

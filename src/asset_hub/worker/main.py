@@ -15,6 +15,7 @@ from asset_hub.jobs import JobStore
 from asset_hub.pack.excel import (
     ExcelRow,
     deduplicate_rows,
+    ensure_sku_in_filename,
     match_assets_for_rows,
     read_excel_rows,
 )
@@ -229,14 +230,16 @@ def process_job(store: JobStore, catalog: Catalog, job_id: str) -> None:
                                 folder += f"_copy{copy_index}"
                             for asset in grouped_assets:
                                 src = Path(asset.local_path)
-                                pairs.append((src, f"{base}/{folder}/{src.name}"))
+                                output_name = ensure_sku_in_filename(src.name, sku)
+                                pairs.append((src, f"{base}/{folder}/{output_name}"))
                 elif "rename_sku_sequence" in handlers:
                     src = Path(assets[0].local_path)
+                    export_name = Path(ensure_sku_in_filename(src.name, sku))
                     for copy_index in range(1, copies + 1):
                         suffix = instance_suffix
                         if copies > 1:
                             suffix += f"_copy{copy_index}"
-                        output_name = f"{src.stem}{suffix}{src.suffix.lower()}"
+                        output_name = f"{export_name.stem}{suffix}{export_name.suffix.lower()}"
                         pairs.append((src, f"{base}/{output_name}"))
                 else:
                     for asset in assets:
