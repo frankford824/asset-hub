@@ -185,12 +185,42 @@ async function loadLibrary(path, { append = false, pushHistory = false } = {}) {
 }
 function navigate(path) { loadLibrary(path, { pushHistory: true }).catch(showError); }
 function renderBreadcrumbs(items) { $("#breadcrumbs").innerHTML = items.map((item) => `<button type="button" data-path="${escapeHtml(item.path)}">${escapeHtml(item.name)}</button>`).join(""); $$("button", $("#breadcrumbs")).forEach((button) => button.addEventListener("click", () => navigate(button.dataset.path))); }
+function searchSetFolders() {
+  if (state.hasMore || !/^[A-Z]+\d+$/i.test(state.query)) return [];
+  const groups = new Map();
+  for (const file of state.files) {
+    if (!isImage(file.file_name)) continue;
+    const parent = (file.virtual_path || "").split("/").slice(0, -1).join("/");
+    const name = parent.split("/").pop() || "";
+    const codes = name.match(/[A-Za-z]+\d+/g) || [];
+    if (!parent || parent === state.path || !codes.some((code) => code.toUpperCase() === state.query.toUpperCase())) continue;
+    if (!groups.has(parent)) groups.set(parent, { path: parent, name, members: [] });
+    groups.get(parent).members.push(file);
+  }
+  return [...groups.values()].filter((folder) => folder.members.length > 1);
+}
 function renderLibrary() {
+  const sets = searchSetFolders();
+  const groupedIds = new Set(sets.flatMap((folder) => folder.members.map((file) => file.asset_id)));
+  const visibleFiles = state.files.filter((file) => !groupedIds.has(file.asset_id));
+  const folders = [...state.directories, ...sets.map((folder) => ({ ...folder, file_count: folder.members.length }))];
   $("#folder-title").textContent = state.query ? `搜索：${state.query}` : (state.path.split("/").pop() || "素材库");
-  $("#folder-count").textContent = `${state.directories.length} 个目录 · ${state.files.length}${state.hasMore ? "+" : ""} 个文件`;
-  $("#folder-grid").innerHTML = state.directories.map((folder) => `<div class="folder-tile" data-path="${escapeHtml(folder.path)}"><span class="folder-art">▰</span><span><strong title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</strong><small>${folder.file_count || 0} 个文件</small></span></div>`).join("");
-  $$(".folder-tile").forEach((tile) => { tile.addEventListener("dblclick", () => navigate(tile.dataset.path)); tile.addEventListener("click", () => { $$(".folder-tile").forEach((item) => item.classList.remove("selected")); tile.classList.add("selected"); }); });
-  $("#file-grid").innerHTML = state.files.map((file) => {
+  $("#folder-count").textContent = `${folders.length} 个目录 · ${visibleFiles.length}${state.hasMore ? "+" : ""} 个文件${sets.length ? `（套装内 ${groupedIds.size} 张图）` : ""}`;
+  $("#folder-grid").innerHTML = folders.map((folder) => `<div class="folder-tile ${folder.members?.every((file) => state.selected.has(file.asset_id)) ? "selected" : ""}" tabindex="0" role="button" aria-label="${escapeHtml(folder.name)}" data-path="${escapeHtml(folder.path)}"><span class="folder-art">▰</span><span><strong title="${escapeHtml(folder.name)}">${escapeHtml(folder.name)}</strong><small>${folder.file_count || 0} 个文件${folder.members ? " · 单击整套选择，双击打开" : ""}</small></span></div>`).join("");
+  $$(".folder-tile").forEach((tile) => {
+    const folder = sets.find((item) => item.path === tile.dataset.path);
+    tile.addEventListener("dblclick", () => navigate(tile.dataset.path));
+    tile.addEventListener("keydown", (event) => { if (event.key === "Enter") navigate(tile.dataset.path); });
+    tile.addEventListener("click", () => {
+      if (folder) {
+        state.selected = new Set(folder.members.map((file) => file.asset_id)); state.focusedId = null;
+        $$(".folder-tile").forEach((item) => item.classList.toggle("selected", item === tile));
+        $$(".file-tile").forEach((item) => item.classList.remove("selected"));
+        updateSelection();
+      } else { $$(".folder-tile").forEach((item) => item.classList.remove("selected")); tile.classList.add("selected"); }
+    });
+  });
+  $("#file-grid").innerHTML = visibleFiles.map((file) => {
     const preview = file.previewable || isImage(file.file_name); const ext = (file.file_name.split(".").pop() || "FILE").slice(0, 5).toUpperCase();
     return `<article class="file-tile ${state.selected.has(file.asset_id) ? "selected" : ""}" draggable="true" data-id="${escapeHtml(file.asset_id)}"><span class="file-check">✓</span><div class="file-thumb">${preview ? `<img src="${previewUrl(file.asset_id)}" alt="" loading="lazy" />` : `<span class="file-icon">${escapeHtml(ext)}</span>`}</div><div class="file-label"><strong title="${escapeHtml(file.file_name)}">${escapeHtml(file.file_name)}</strong><small>${fmtBytes(file.file_size)}</small></div></article>`;
   }).join("");

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from asset_hub import __version__
-from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path
+from asset_hub.catalog.db import AssetRow, Catalog, normalize_virtual_path, extract_sku_tokens, SKU_QUERY_RE
 from asset_hub.config import ensure_data_dirs, get_settings, library_mount_available
 from asset_hub.jobs import JobStore
 from asset_hub.pack.rules import PackRuleStore, SUPPORTED_HANDLERS
@@ -205,6 +205,18 @@ def _download_archive(asset_ids: list[str], background_tasks: BackgroundTasks) -
         if source.is_file():
             selected.append((asset, source))
     sku_codes = catalog.resolve_asset_sku_codes([asset for asset, _source in selected])
+    # A multi-image selection from one SKU directory remains a folder in the ZIP.
+    parents = {str(Path(asset.virtual_path).parent) for asset, _ in selected}
+    folder_name = ""
+    if len(selected) > 1 and len(parents) == 1:
+        parent = next(iter(parents))
+        codes = {token for token in extract_sku_tokens(Path(parent).name) if SKU_QUERY_RE.fullmatch(token)}
+        if parent != "." and len(codes) == 1 and all(
+            not asset.sku_code or asset.sku_code.strip().upper() in codes for asset, _ in selected
+        ):
+            folder_name = Path(parent).name
+            for asset, _ in selected:
+                sku_codes[asset.asset_id] = next(iter(codes))
     pairs: list[tuple[Path, str]] = []
     used_names: dict[str, int] = {}
     for asset, source in selected:
@@ -217,7 +229,7 @@ def _download_archive(asset_ids: list[str], background_tasks: BackgroundTasks) -
         if count > 1:
             export_path = Path(export_name)
             arcname = f"{export_path.stem}_{count}{export_path.suffix}"
-        pairs.append((source, arcname))
+        pairs.append((source, f"{folder_name}/{arcname}" if folder_name else arcname))
     if not pairs:
         raise HTTPException(404, "所选素材均不可用")
     archive = settings.tmp_dir / f"素材下载-{uuid.uuid4().hex}.zip"

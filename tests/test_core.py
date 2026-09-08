@@ -974,6 +974,30 @@ def test_downloads_resolve_sku_from_generic_external_product_path(settings):
     }
 
 
+def test_set_download_preserves_folder_and_each_payload(settings):
+    catalog = Catalog(settings)
+    folder = "HSC17265——中秋套餐"
+    ids = []
+    for index, name in enumerate(("月饼兔子.png", "中秋.png", "桂花兔子.png")):
+        source = settings.library_root / folder / name
+        source.parent.mkdir(exist_ok=True)
+        source.write_bytes(name.encode())
+        asset_id = f"external:set-{index}"
+        ids.append(asset_id)
+        catalog.upsert_asset(AssetRow(asset_id=asset_id, kind="external",
+            file_name=name, file_size=source.stat().st_size,
+            local_path=str(source), virtual_path=f"{folder}/{name}", status="ready"))
+    from asset_hub.api.main import app
+    client = TestClient(app)
+    ticket = client.post("/api/v1/assets/download-ticket", json={"ids": ids}).json()
+    response = client.get(ticket["download_url"])
+    assert response.status_code == 200
+    with zipfile.ZipFile(BytesIO(response.content)) as z:
+        assert len(z.namelist()) == 3
+        for name in ("月饼兔子.png", "中秋.png", "桂花兔子.png"):
+            assert z.read(f"{folder}/HSC17265——{name}") == name.encode()
+
+
 def test_job_pruning_removes_only_expired_terminal_jobs(settings):
     store = JobStore(settings)
     now = time.time()
