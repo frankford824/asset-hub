@@ -431,6 +431,10 @@ def _process_external_ticket(
             ),
         )
         stats["size_mismatch"] += 1
+        log.warning(
+            "external size mismatch external_asset_id=%s expected=%s actual=%s",
+            external_asset_id, ticket.expected_size, ticket.actual_size,
+        )
         return False
     if ticket.status == "error":
         catalog.mark_asset_status(
@@ -575,7 +579,7 @@ def sync_external_once(provider: SyncProvider | None = None) -> dict:
         stats["manifest_items"] = stats["active"]
 
     last_verified = float(state.get("last_verified_at") or 0)
-    verify_due = bool(last_verified) and (
+    verify_due = (
         time.time() - last_verified >= settings.sync.verify_interval_sec
     )
     candidates = catalog.ticket_candidates(

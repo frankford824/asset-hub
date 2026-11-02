@@ -1114,7 +1114,10 @@ class Catalog:
                     # path+size. Once an external row exists, every upstream
                     # fingerprint/storage/size change forces a fresh ticket and
                     # atomic download, including same-size replacements.
-                    if metadata_changed:
+                    # A retained file cannot clear a failed ticket validation.
+                    # Existing non-ready records need a fresh ready ticket even
+                    # when a replay carries identical path/size metadata.
+                    if metadata_changed or (previous and previous["status"] != "ready"):
                         local_valid = False
                 status = (
                     "tombstone"
@@ -1264,6 +1267,7 @@ class Catalog:
                 verify_all
                 or (include_nonready and row.status != "ready")
                 or row.status == "pending"
+                or row.status == "size_mismatch"
                 or row.retryable
                 or (row.status == "ready" and not local_valid)
             ):

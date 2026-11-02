@@ -87,6 +87,12 @@ atomic rename。`missing`、`size_mismatch`、`not_current` 或 `error` 均不�
 Manifest 返回 304，也会按 `verify_interval_sec` 定期为全部当前对象重新申请
 ticket，以发现同 key 覆盖或 OSS 删除。
 
+`size_mismatch` 即使来自旧版的不可重试记录，也会在下一轮同步重新申请
+ticket；首次尚无 `last_verified_at` 的外部缓存也必须执行全量校验。清单或
+增量事件重放只能保留已验证的 `ready` 缓存，不能仅凭文件路径和大小相同，
+把 `pending`、失败或撤回记录恢复成 `ready`；这些记录必须重新通过 ticket
+校验。大小冲突日志包含素材 ID、预期字节数和实际字节数，便于逐笔追溯。
+
 external-current 以线上 source fingerprint、相对路径、大小和 OSS ticket 为准。
 已有 `/home/resourse` 文件在路径、大小和源修改时间一致时直接复用，不重复产生
 OSS 下行；新增或替换文件才写入本地镜像。线上 missing 路径作为 tombstone 覆盖
