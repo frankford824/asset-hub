@@ -137,7 +137,10 @@ function renderJobs() {
   box.innerHTML = state.jobs.map((job) => {
     const percent = Number(job.progress?.percent) || 0;
     const label = { queued: "排队中", running: "处理中", done: "已完成", failed: "失败" }[job.status] || job.status;
-    return `<div class="job-row"><div><strong>${escapeHtml(job.filename || job.id)}</strong><small>${escapeHtml(label)} · ${escapeHtml(job.progress?.label || "")}</small></div><div class="job-progress"><i style="width:${Math.max(0, Math.min(100, percent))}%"></i></div><div>${job.has_download ? `<a class="btn secondary" href="/api/v1/jobs/${job.id}/download">下载</a>` : `<small>${percent}%</small>`}</div></div>`;
+    const finishedAt = job.finished_at ? new Date(Number(job.finished_at) * 1000) : null;
+    const completionTime = job.status === "done" && finishedAt && Number.isFinite(finishedAt.getTime())
+      ? `<time class="job-finished-at" datetime="${finishedAt.toISOString()}" title="完成时间（本地时区）">完成时间：${escapeHtml(fmtTime(job.finished_at))}</time>` : "";
+    return `<div class="job-row"><div><div class="job-heading"><strong>${escapeHtml(job.filename || job.id)}</strong>${completionTime}</div><small>${escapeHtml(label)} · ${escapeHtml(job.progress?.label || "")}</small></div><div class="job-progress"><i style="width:${Math.max(0, Math.min(100, percent))}%"></i></div><div>${job.has_download ? `<a class="btn secondary" href="/api/v1/jobs/${job.id}/download">下载</a>` : `<small>${percent}%</small>`}</div></div>`;
   }).join("");
 }
 async function submitPack(event) {
